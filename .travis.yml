@@ -1,6 +1,12 @@
 language: rust
 rust:
   - stable
+env:
+  - PATH="${PATH}:~/flatbuffers_dep/bin"
+before_install:
+  - git clone https://github.com/google/flatbuffers flatbuffers_dep
+  - cd flatbuffers_dep && cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+  - cd flatbuffers_dep && make -j2 && mkdir bin && mv flatc bin/
 before_script:
 - rustup component add rustfmt
 script:
