@@ -20,7 +20,7 @@ env_logger = "0.11.5"
 slog-stdlog = "4.1"
 slog = "2.7" # slog is only used by the raft dependency
 fuser = "0.17.0"
-rkyv = "0.8.8"
+zerialize = { git = "https://github.com/cberner/zerialize.git", rev = "010423e23c7c086a819f53d4726aab41f3d62652" }
 redb = "3.0.0"
 redb-derive = "0.1.0"
 libc = "0.2"

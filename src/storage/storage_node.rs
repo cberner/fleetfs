@@ -17,7 +17,6 @@ use crate::base::LocalContext;
 use crate::client::RemoteRaftGroups;
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
 use futures_util::stream::StreamExt;
-use rkyv::util::AlignedVec;
 use tokio::io::AsyncWriteExt;
 
 fn spawn_connection_handler(
@@ -43,10 +42,13 @@ fn spawn_connection_handler(
                     }
                 },
             };
-            let mut aligned = AlignedVec::with_capacity(frame.len());
-            aligned.extend_from_slice(&frame);
-            let response =
-                request_router(aligned, raft.clone(), remote_raft.clone(), context.clone()).await;
+            let response = request_router(
+                frame.to_vec(),
+                raft.clone(),
+                remote_raft.clone(),
+                context.clone(),
+            )
+            .await;
             // TODO optimize this to avoid the copy
             let mut result = vec![0u8; response.len() + 4];
             result[4..].copy_from_slice(&response);

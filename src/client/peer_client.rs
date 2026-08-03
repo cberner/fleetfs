@@ -2,14 +2,12 @@ use log::error;
 use std::net::SocketAddr;
 
 use crate::base::response_or_error;
-use crate::base::{CommitId, ErrorCode, RkyvRequest};
+use crate::base::{CommitId, ErrorCode, Request, encode_request};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Either, ok, ready};
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::Message;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +20,7 @@ pub trait PeerClient {
     fn send_raw<T: AsRef<[u8]> + Send + 'static>(
         &self,
         data: T,
-    ) -> BoxFuture<'static, Result<AlignedVec, std::io::Error>>;
+    ) -> BoxFuture<'static, Result<Vec<u8>, std::io::Error>>;
 
     fn send_raft_message(&self, raft_group: u16, message: Message) -> BoxFuture<'static, ()>;
 
@@ -50,7 +48,7 @@ async fn async_send_and_receive<T: AsRef<[u8]> + Send>(
     mut stream: TcpStream,
     data: T,
     pool: Arc<Mutex<Vec<TcpStream>>>,
-) -> Result<AlignedVec, std::io::Error> {
+) -> Result<Vec<u8>, std::io::Error> {
     let mut request = vec![0; 4 + data.as_ref().len()];
     LittleEndian::write_u32(&mut request[..4], data.as_ref().len() as u32);
     // TODO: remove this copy and use vectored write of the header and data separately,
@@ -64,9 +62,7 @@ async fn async_send_and_receive<T: AsRef<[u8]> + Send>(
     stream.read_exact(&mut response_size).await?;
 
     let size = LittleEndian::read_u32(&response_size);
-    let mut buffer = AlignedVec::with_capacity(size as usize);
-    // TODO: this seems very wasteful. There should be a AlignedVec.zeros() method
-    buffer.extend_from_slice(&vec![0u8; size as usize]);
+    let mut buffer = vec![0u8; size as usize];
     stream.read_exact(&mut buffer).await?;
 
     TcpPeerClient::return_connection(pool, stream);
@@ -95,14 +91,14 @@ impl TcpPeerClient {
 
     pub fn send(
         &self,
-        request: &RkyvRequest,
-    ) -> BoxFuture<'static, Result<AlignedVec, std::io::Error>> {
+        request: &Request<'_>,
+    ) -> BoxFuture<'static, Result<Vec<u8>, std::io::Error>> {
         let pool = self.pool.clone();
-        let rkyv_bytes = rkyv::to_bytes::<rancor::Error>(request).unwrap();
+        let request_bytes = encode_request(request);
 
         self.connect()
             .then(move |tcp_stream| match tcp_stream {
-                Ok(stream) => Either::Left(async_send_and_receive(stream, rkyv_bytes, pool)),
+                Ok(stream) => Either::Left(async_send_and_receive(stream, request_bytes, pool)),
                 Err(e) => Either::Right(ready(Err(e))),
             })
             .boxed()
@@ -120,7 +116,7 @@ impl PeerClient for TcpPeerClient {
     fn send_raw<T: AsRef<[u8]> + Send + 'static>(
         &self,
         data: T,
-    ) -> BoxFuture<'static, Result<AlignedVec, std::io::Error>> {
+    ) -> BoxFuture<'static, Result<Vec<u8>, std::io::Error>> {
         let pool = self.pool.clone();
 
         self.connect()
@@ -134,9 +130,9 @@ impl PeerClient for TcpPeerClient {
     fn send_raft_message(&self, raft_group: u16, message: Message) -> BoxFuture<'static, ()> {
         let serialized_message = message.write_to_bytes().unwrap();
         let ip_and_port = self.server_ip_port;
-        self.send(&RkyvRequest::RaftMessage {
+        self.send(&Request::RaftMessage {
             raft_group,
-            data: serialized_message,
+            data: &serialized_message,
         })
         .map(move |x| {
             if let Err(io_error) = x {
@@ -153,7 +149,7 @@ impl PeerClient for TcpPeerClient {
         &self,
         raft_group: u16,
     ) -> BoxFuture<'static, Result<u64, std::io::Error>> {
-        self.send(&RkyvRequest::LatestCommit { raft_group })
+        self.send(&Request::LatestCommit { raft_group })
             .map(|response| {
                 response.map(|data| {
                     let response = response_or_error(&data).unwrap();
@@ -164,7 +160,7 @@ impl PeerClient for TcpPeerClient {
     }
 
     fn filesystem_checksum(&self) -> BoxFuture<'static, Result<HashMap<u16, Vec<u8>>, ErrorCode>> {
-        self.send(&RkyvRequest::FilesystemChecksum)
+        self.send(&Request::FilesystemChecksum)
             .map(|maybe_response| {
                 let data = maybe_response.map_err(|_| ErrorCode::Uncategorized)?;
                 let response = response_or_error(&data).unwrap();
@@ -182,7 +178,7 @@ impl PeerClient for TcpPeerClient {
         size: u32,
         required_commit: CommitId,
     ) -> BoxFuture<'static, Result<Vec<u8>, std::io::Error>> {
-        let request = RkyvRequest::ReadRaw {
+        let request = Request::ReadRaw {
             required_commit,
             inode,
             offset,

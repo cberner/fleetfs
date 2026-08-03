@@ -4,14 +4,14 @@ use std::net::SocketAddr;
 
 use crate::base::response_or_error;
 use crate::base::{
-    ArchivedRkyvGenericResponse, EntryMetadata, ErrorCode, FileKind, RkyvRequest, Timestamp,
-    UserContext,
+    EntryMetadata, ErrorCode, FileKind, Request, ResponseView, Timestamp, UserContext,
+    WireResponse, encode_request,
 };
 use crate::client::tcp_client::TcpClient;
 use crate::storage::ROOT_INODE;
 use fuser::FileAttr;
-use rkyv::util::AlignedVec;
 use std::time::SystemTime;
+use zerialize::List;
 
 fn to_fuse_file_type(file_type: FileKind) -> fuser::FileType {
     match file_type {
@@ -47,7 +47,7 @@ fn metadata_to_fuse_fileattr(metadata: &EntryMetadata) -> FileAttr {
 }
 
 thread_local! {
-    static RESPONSE_BUFFERS: RefCell<AlignedVec> = RefCell::new(AlignedVec::new());
+    static RESPONSE_BUFFERS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 pub struct NodeClient {
@@ -63,10 +63,10 @@ impl NodeClient {
 
     fn send<'a>(
         &self,
-        request: RkyvRequest,
-        buffer: &'a mut AlignedVec,
-    ) -> Result<&'a ArchivedRkyvGenericResponse, ErrorCode> {
-        let request_buffer = rkyv::to_bytes::<rkyv::rancor::Error>(&request).unwrap();
+        request: Request<'_>,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<ResponseView<'a>, ErrorCode> {
+        let request_buffer = encode_request(&request);
         self.tcp_client
             .send_and_receive(&request_buffer, buffer)
             .map_err(|_| ErrorCode::Uncategorized)?;
@@ -75,7 +75,7 @@ impl NodeClient {
 
     pub fn filesystem_ready(&self) -> Result<(), ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::FilesystemReady, buffer)?;
+            let response = self.send(Request::FilesystemReady, buffer)?;
             response.as_empty_response().ok_or(ErrorCode::BadResponse)?;
 
             Ok(())
@@ -84,7 +84,7 @@ impl NodeClient {
 
     pub fn fsck(&self) -> Result<(), ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::FilesystemCheck, buffer)?;
+            let response = self.send(Request::FilesystemCheck, buffer)?;
             response.as_empty_response().ok_or(ErrorCode::BadResponse)?;
 
             Ok(())
@@ -99,9 +99,9 @@ impl NodeClient {
         gid: u32,
         mode: u16,
     ) -> Result<FileAttr, ErrorCode> {
-        let request = RkyvRequest::Mkdir {
+        let request = Request::Mkdir {
             parent,
-            name: name.to_string(),
+            name,
             uid,
             gid,
             mode,
@@ -119,9 +119,9 @@ impl NodeClient {
     pub fn lookup(&self, parent: u64, name: &str, context: UserContext) -> Result<u64, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::Lookup {
+                Request::Lookup {
                     parent,
-                    name: name.to_string(),
+                    name,
                     context,
                 },
                 buffer,
@@ -142,9 +142,9 @@ impl NodeClient {
     ) -> Result<FileAttr, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::Create {
+                Request::Create {
                     parent,
-                    name: name.to_string(),
+                    name,
                     uid,
                     gid,
                     mode,
@@ -160,15 +160,15 @@ impl NodeClient {
 
     pub fn statfs(&self) -> Result<StatFS, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::FilesystemInformation, buffer)?;
-            if let ArchivedRkyvGenericResponse::FilesystemInformation {
+            let response = self.send(Request::FilesystemInformation, buffer)?;
+            if let WireResponse::FilesystemInformation {
                 block_size,
                 max_name_length,
             } = response
             {
                 Ok(StatFS {
-                    block_size: block_size.into(),
-                    max_name_length: max_name_length.into(),
+                    block_size,
+                    max_name_length,
                 })
             } else {
                 Err(ErrorCode::BadResponse)
@@ -178,7 +178,7 @@ impl NodeClient {
 
     pub fn getattr(&self, inode: u64) -> Result<FileAttr, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::GetAttr { inode }, buffer)?;
+            let response = self.send(Request::GetAttr { inode }, buffer)?;
 
             Ok(metadata_to_fuse_fileattr(
                 &response.as_attr_response().unwrap(),
@@ -194,9 +194,9 @@ impl NodeClient {
     ) -> Result<Vec<u8>, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::GetXattr {
+                Request::GetXattr {
                     inode,
-                    key: key.to_string(),
+                    key,
                     context,
                 },
                 buffer,
@@ -209,7 +209,7 @@ impl NodeClient {
 
     pub fn listxattr(&self, inode: u64) -> Result<Vec<String>, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::ListXattrs { inode }, buffer)?;
+            let response = self.send(Request::ListXattrs { inode }, buffer)?;
 
             let xattrs = response
                 .as_xattrs_response()
@@ -230,10 +230,10 @@ impl NodeClient {
     ) -> Result<(), ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::SetXattr {
+                Request::SetXattr {
                     inode,
-                    key: key.to_string(),
-                    value: value.to_vec(),
+                    key,
+                    value,
                     context,
                 },
                 buffer,
@@ -250,9 +250,9 @@ impl NodeClient {
         key: &str,
         context: UserContext,
     ) -> Result<(), ErrorCode> {
-        let request = RkyvRequest::RemoveXattr {
+        let request = Request::RemoveXattr {
             inode,
-            key: key.to_string(),
+            key,
             context,
         };
 
@@ -272,7 +272,7 @@ impl NodeClient {
         context: UserContext,
     ) -> Result<(), ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
-        let request = RkyvRequest::Utimens {
+        let request = Request::Utimens {
             inode,
             atime,
             mtime,
@@ -291,7 +291,7 @@ impl NodeClient {
         if inode == ROOT_INODE {
             return Err(ErrorCode::OperationNotPermitted);
         }
-        let request = RkyvRequest::Chmod {
+        let request = Request::Chmod {
             inode,
             mode,
             context,
@@ -313,7 +313,7 @@ impl NodeClient {
         context: UserContext,
     ) -> Result<(), ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
-        let request = RkyvRequest::Chown {
+        let request = Request::Chown {
             inode,
             uid,
             gid,
@@ -336,10 +336,10 @@ impl NodeClient {
         context: UserContext,
     ) -> Result<FileAttr, ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
-        let request = RkyvRequest::Hardlink {
+        let request = Request::Hardlink {
             inode,
             new_parent,
-            new_name: new_name.to_string(),
+            new_name,
             context,
         };
 
@@ -360,11 +360,11 @@ impl NodeClient {
         new_name: &str,
         context: UserContext,
     ) -> Result<(), ErrorCode> {
-        let request = RkyvRequest::Rename {
+        let request = Request::Rename {
             parent,
-            name: name.to_string(),
+            name,
             new_parent,
-            new_name: new_name.to_string(),
+            new_name,
             context,
         };
 
@@ -383,7 +383,7 @@ impl NodeClient {
         // instead we should be using a special readlink message
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::Read {
+                Request::Read {
                     inode,
                     offset: 0,
                     read_size: 999_999,
@@ -408,7 +408,7 @@ impl NodeClient {
 
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             match self.send(
-                RkyvRequest::Read {
+                Request::Read {
                     inode,
                     offset,
                     read_size: size,
@@ -428,13 +428,13 @@ impl NodeClient {
 
     pub fn readdir(&self, inode: u64) -> Result<Vec<(u64, OsString, fuser::FileType)>, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::ListDir { inode }, buffer)?;
+            let response = self.send(Request::ListDir { inode }, buffer)?;
 
             let mut result = vec![];
             let entries = response
                 .as_directory_listing_response()
                 .ok_or(ErrorCode::BadResponse)?;
-            for entry in entries {
+            for entry in entries.iter() {
                 result.push((
                     entry.inode,
                     OsString::from(entry.name),
@@ -448,7 +448,7 @@ impl NodeClient {
 
     pub fn truncate(&self, inode: u64, length: u64, context: UserContext) -> Result<(), ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
-        let request = RkyvRequest::Truncate {
+        let request = Request::Truncate {
             inode,
             new_length: length,
             context,
@@ -465,10 +465,10 @@ impl NodeClient {
     pub fn write(&self, inode: u64, data: &[u8], offset: u64) -> Result<u32, ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
             let response = self.send(
-                RkyvRequest::Write {
+                Request::Write {
                     inode,
                     offset,
-                    data: data.to_vec(),
+                    data,
                 },
                 buffer,
             )?;
@@ -481,7 +481,7 @@ impl NodeClient {
 
     pub fn fsync(&self, inode: u64) -> Result<(), ErrorCode> {
         RESPONSE_BUFFERS.with_borrow_mut(|buffer| {
-            let response = self.send(RkyvRequest::Fsync { inode }, buffer)?;
+            let response = self.send(Request::Fsync { inode }, buffer)?;
             response.as_empty_response().ok_or(ErrorCode::BadResponse)?;
 
             Ok(())
@@ -489,9 +489,9 @@ impl NodeClient {
     }
 
     pub fn unlink(&self, parent: u64, name: &str, context: UserContext) -> Result<(), ErrorCode> {
-        let request = RkyvRequest::Unlink {
+        let request = Request::Unlink {
             parent,
-            name: name.to_string(),
+            name,
             context,
         };
 
@@ -504,9 +504,9 @@ impl NodeClient {
     }
 
     pub fn rmdir(&self, parent: u64, name: &str, context: UserContext) -> Result<(), ErrorCode> {
-        let request = RkyvRequest::Rmdir {
+        let request = Request::Rmdir {
             parent,
-            name: name.to_string(),
+            name,
             context,
         };
 

@@ -3,7 +3,7 @@ use std::fs;
 
 use crate::base::node_id_from_address;
 use crate::base::{
-    CommitId, DirectoryEntry, EntryMetadata, ErrorCode, FileKind, RkyvGenericResponse, Timestamp,
+    CommitId, EntryMetadata, ErrorCode, FileKind, OwnedDirectoryEntry, Response, Timestamp,
     UserContext,
 };
 use crate::client::TcpPeerClient;
@@ -38,11 +38,8 @@ fn build_fileattr_response(
     }
 }
 
-fn to_fileattr_response(
-    attributes: InodeAttributes,
-    directory_entries: Option<u32>,
-) -> RkyvGenericResponse {
-    RkyvGenericResponse::EntryMetadata(build_fileattr_response(attributes, directory_entries))
+fn to_fileattr_response(attributes: InodeAttributes, directory_entries: Option<u32>) -> Response {
+    Response::EntryMetadata(build_fileattr_response(attributes, directory_entries))
 }
 
 pub struct FileStorage {
@@ -88,8 +85,8 @@ impl FileStorage {
             .map_err(|_| ErrorCode::Uncategorized)
     }
 
-    pub fn statfs(&self) -> RkyvGenericResponse {
-        RkyvGenericResponse::FilesystemInformation {
+    pub fn statfs(&self) -> Response {
+        Response::FilesystemInformation {
             block_size: BLOCK_SIZE as u32,
             max_name_length: MAX_NAME_LENGTH,
         }
@@ -100,11 +97,11 @@ impl FileStorage {
         parent: u64,
         name: &str,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         let maybe_inode = self.metadata_storage.lookup(parent, name, context)?;
 
         if let Some(inode) = maybe_inode {
-            Ok(RkyvGenericResponse::Inode { id: inode })
+            Ok(Response::Inode { id: inode })
         } else {
             Err(ErrorCode::DoesNotExist)
         }
@@ -115,27 +112,27 @@ impl FileStorage {
         inode: u64,
         new_length: u64,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         self.metadata_storage.truncate(inode, new_length, context)?;
         self.data_storage.truncate(inode, new_length).unwrap();
 
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
-    pub fn readdir(&self, inode: u64) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn readdir(&self, inode: u64) -> Result<Response, ErrorCode> {
         let mut entries = vec![];
         for (inode, filename, file_type) in self.metadata_storage.readdir(inode)? {
-            entries.push(DirectoryEntry {
+            entries.push(OwnedDirectoryEntry {
                 inode,
                 name: filename,
                 kind: file_type,
             });
         }
 
-        Ok(RkyvGenericResponse::DirectoryListing(entries))
+        Ok(Response::DirectoryListing(entries))
     }
 
-    pub fn getattr(&self, inode: u64) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn getattr(&self, inode: u64) -> Result<Response, ErrorCode> {
         let (attributes, directory_entries) = self.metadata_storage.get_attributes(inode)?;
         Ok(to_fileattr_response(attributes, directory_entries))
     }
@@ -146,11 +143,11 @@ impl FileStorage {
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
         self.metadata_storage
             .utimens(inode, atime, mtime, context)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn chmod(
@@ -158,10 +155,10 @@ impl FileStorage {
         inode: u64,
         mode: u32,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
         self.metadata_storage.chmod(inode, mode, context)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn chown(
@@ -170,15 +167,15 @@ impl FileStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         assert_ne!(inode, ROOT_INODE);
         self.metadata_storage.chown(inode, uid, gid, context)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
-    pub fn fsync(&self, inode: u64) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn fsync(&self, inode: u64) -> Result<Response, ErrorCode> {
         self.data_storage.fsync(inode)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn read(
@@ -187,55 +184,42 @@ impl FileStorage {
         offset: u64,
         read_size: u32,
         required_commit: CommitId,
-    ) -> impl Future<Output = Result<RkyvGenericResponse, ErrorCode>> + '_ {
+    ) -> impl Future<Output = Result<Response, ErrorCode>> + '_ {
         // No access check is needed, since we rely on the client to do it
         let read_result = self
             .data_storage
             .read(inode, offset, read_size, required_commit);
-        read_result.map(move |response| response.map(|data| RkyvGenericResponse::Read { data }))
+        read_result.map(move |response| response.map(|data| Response::Read { data }))
     }
 
-    pub fn read_raw(
-        &self,
-        inode: u64,
-        offset: u64,
-        read_size: u32,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn read_raw(&self, inode: u64, offset: u64, read_size: u32) -> Result<Response, ErrorCode> {
         let data = self
             .data_storage
             .read_raw(inode, offset, read_size)
             .map_err(into_error_code)?;
-        Ok(RkyvGenericResponse::Read { data })
+        Ok(Response::Read { data })
     }
 
-    pub fn write(
-        &self,
-        inode: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn write(&self, inode: u64, offset: u64, data: &[u8]) -> Result<Response, ErrorCode> {
         self.metadata_storage
             .write(inode, offset, data.len() as u32)?;
         let write_result = self.data_storage.write_local_blocks(inode, offset, data);
         // Reply with the total requested write size, since that's what the FUSE client is expecting, even though this node only wrote some of the bytes
         let total_bytes = data.len() as u32;
         write_result
-            .map(move |_| RkyvGenericResponse::Written {
+            .map(move |_| Response::Written {
                 bytes_written: total_bytes,
             })
             .map_err(into_error_code)
     }
 
-    pub fn hardlink_stage0_link_increment(
-        &self,
-        inode: u64,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn hardlink_stage0_link_increment(&self, inode: u64) -> Result<Response, ErrorCode> {
         let rollback = self
             .metadata_storage
             .hardlink_stage0_link_increment(inode)?;
         let (attributes, directory_size) = self.metadata_storage.get_attributes(inode)?;
         let attrs = build_fileattr_response(attributes, directory_size);
-        Ok(RkyvGenericResponse::HardlinkTransaction {
+        Ok(Response::HardlinkTransaction {
             rollback_last_modified: rollback,
             attrs,
         })
@@ -248,10 +232,10 @@ impl FileStorage {
         new_name: &str,
         context: UserContext,
         inode_kind: FileKind,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         self.metadata_storage
             .create_link(inode, new_parent, new_name, context, inode_kind)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn replace_link(
@@ -261,38 +245,31 @@ impl FileStorage {
         new_inode: u64,
         kind: FileKind,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         let old_inode = self
             .metadata_storage
             .replace_link(parent, name, new_inode, kind, context)?;
-        Ok(RkyvGenericResponse::Inode { id: old_inode })
+        Ok(Response::Inode { id: old_inode })
     }
 
-    pub fn update_parent(
-        &self,
-        inode: u64,
-        new_parent: u64,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn update_parent(&self, inode: u64, new_parent: u64) -> Result<Response, ErrorCode> {
         self.metadata_storage.update_parent(inode, new_parent)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
-    pub fn update_metadata_changed_time(
-        &self,
-        inode: u64,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    pub fn update_metadata_changed_time(&self, inode: u64) -> Result<Response, ErrorCode> {
         self.metadata_storage.update_metadata_changed_time(inode)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn hardlink_rollback(
         &self,
         inode: u64,
         last_metadata_changed: Timestamp,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         self.metadata_storage
             .hardlink_rollback(inode, last_metadata_changed)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn get_xattr(
@@ -300,13 +277,13 @@ impl FileStorage {
         inode: u64,
         key: &str,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         let attr = self.metadata_storage.get_xattr(inode, key, context)?;
-        Ok(RkyvGenericResponse::Read { data: attr })
+        Ok(Response::Read { data: attr })
     }
 
-    pub fn list_xattrs(&self, inode: u64) -> Result<RkyvGenericResponse, ErrorCode> {
-        Ok(RkyvGenericResponse::Xattrs {
+    pub fn list_xattrs(&self, inode: u64) -> Result<Response, ErrorCode> {
+        Ok(Response::Xattrs {
             attrs: self.metadata_storage.list_xattrs(inode)?,
         })
     }
@@ -317,10 +294,10 @@ impl FileStorage {
         key: &str,
         value: &[u8],
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         self.metadata_storage
             .set_xattr(inode, key, value, context)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn remove_xattr(
@@ -328,9 +305,9 @@ impl FileStorage {
         inode: u64,
         key: &str,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         self.metadata_storage.remove_xattr(inode, key, context)?;
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     pub fn remove_link(
@@ -339,12 +316,12 @@ impl FileStorage {
         name: &str,
         link_inode_and_uid: Option<(u64, u32)>,
         context: UserContext,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         info!("Deleting file");
         let (deleted_inode, processed) =
             self.metadata_storage
                 .remove_link(parent, name, link_inode_and_uid, context)?;
-        Ok(RkyvGenericResponse::RemovedInode {
+        Ok(Response::RemovedInode {
             id: deleted_inode,
             complete: processed,
         })
@@ -354,7 +331,7 @@ impl FileStorage {
         &self,
         inode: u64,
         count: u32,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         if let Some(deleted_inode) = self
             .metadata_storage
             .decrement_inode_link_count(inode, count)?
@@ -362,7 +339,7 @@ impl FileStorage {
             self.data_storage.delete(deleted_inode).unwrap();
         }
 
-        Ok(RkyvGenericResponse::Empty)
+        Ok(Response::Empty)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -373,7 +350,7 @@ impl FileStorage {
         gid: u32,
         mode: u16,
         kind: FileKind,
-    ) -> Result<RkyvGenericResponse, ErrorCode> {
+    ) -> Result<Response, ErrorCode> {
         let (_, attributes) = self
             .metadata_storage
             .create_inode(parent, uid, gid, mode, kind)?;

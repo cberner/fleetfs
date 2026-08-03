@@ -1,5 +1,5 @@
 use crate::base::LocalContext;
-use crate::base::{ErrorCode, RkyvGenericResponse};
+use crate::base::{ErrorCode, Response};
 use crate::client::{PeerClient, TcpPeerClient};
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
 use crate::storage::raft_node::sync_with_leader;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub async fn fsck(
     context: LocalContext,
     raft: Arc<LocalRaftGroupManager>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     let mut local_checksums = HashMap::new();
     for rgroup in raft.all_groups() {
         sync_with_leader(rgroup).await?;
@@ -39,14 +39,12 @@ pub async fn fsck(
                 }
             }
 
-            Ok(RkyvGenericResponse::Empty)
+            Ok(Response::Empty)
         })
         .await
 }
 
-pub async fn checksum_request(
-    raft: Arc<LocalRaftGroupManager>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+pub async fn checksum_request(raft: Arc<LocalRaftGroupManager>) -> Result<Response, ErrorCode> {
     let mut checksums = HashMap::new();
     for rgroup in raft.all_groups() {
         sync_with_leader(rgroup).await?;
@@ -54,5 +52,5 @@ pub async fn checksum_request(
         let checksum = rgroup.local_data_checksum()?;
         checksums.insert(rgroup.get_raft_group_id(), checksum);
     }
-    Ok(RkyvGenericResponse::Checksums(checksums))
+    Ok(Response::Checksums(checksums))
 }

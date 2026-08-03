@@ -1,7 +1,6 @@
 use crate::base::{AccessType, RequestMetaInfo};
-use crate::base::{ArchivedRkyvRequest, ErrorCode, RkyvGenericResponse};
+use crate::base::{ErrorCode, Request, Response, decode_request};
 use futures::channel::oneshot::Sender;
-use rkyv::rancor;
 use std::collections::HashMap;
 
 pub enum FileLockType {
@@ -9,7 +8,7 @@ pub enum FileLockType {
     ExclusiveMetadataWriteConcurrentReadsAllowed,
 }
 
-type PendingResponse = Sender<Result<RkyvGenericResponse, ErrorCode>>;
+type PendingResponse = Sender<Result<Response, ErrorCode>>;
 
 type PendingRequest = (Vec<u8>, Option<PendingResponse>);
 
@@ -103,8 +102,8 @@ impl LockTable {
         let mut lock_id = None;
         let mut requests_to_process = self.pending_requests[&inode].len();
         for (i, (data, _)) in self.pending_requests[&inode].iter().enumerate() {
-            let request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(data).unwrap();
-            if matches!(request, ArchivedRkyvRequest::Lock { .. }) {
+            let request = decode_request(data).unwrap();
+            if matches!(request, Request::Lock { .. }) {
                 lock_id = Some(self.lock(inode));
                 requests_to_process = i + 1;
                 break;
