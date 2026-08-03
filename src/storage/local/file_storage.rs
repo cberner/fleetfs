@@ -65,9 +65,9 @@ impl FileStorage {
         let data_dir = storage_dir.join("data");
         let metadata_dir = storage_dir.join("metadata");
         fs::create_dir_all(&data_dir)
-            .unwrap_or_else(|_| panic!("Failed to create data dir: {:?}", &data_dir));
+            .unwrap_or_else(|_| panic!("Failed to create data dir: {data_dir:?}"));
         fs::create_dir_all(&metadata_dir)
-            .unwrap_or_else(|_| panic!("Failed to create metadata dir: {:?}", &metadata_dir));
+            .unwrap_or_else(|_| panic!("Failed to create metadata dir: {metadata_dir:?}"));
         FileStorage {
             data_storage: DataStorage::new(node_id, data_dir.to_str().unwrap(), peer_clients),
             metadata_storage: MetadataStorage::new(raft_group, num_raft_groups, &metadata_dir),

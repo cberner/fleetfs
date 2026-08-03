@@ -883,7 +883,7 @@ impl Filesystem for FleetFUSE {
                     attr.perm,
                     req.uid(),
                     req.gid(),
-                    mask.bits() as i32,
+                    mask.bits(),
                 ) {
                     reply.ok();
                 } else {
