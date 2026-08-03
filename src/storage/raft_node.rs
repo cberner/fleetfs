@@ -27,10 +27,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::base::{ArchivedRkyvRequest, ErrorCode, RkyvGenericResponse, RkyvRequest};
+use crate::base::{ErrorCode, Request, Response, decode_request, encode_request};
 use protobuf::Message as ProtobufMessage;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
 
 // Compact storage when it reaches 10MB
 const COMPACTION_THRESHOLD: u64 = 10 * 1024 * 1024;
@@ -41,7 +39,7 @@ pub async fn sync_with_leader(raft: &RaftNode) -> Result<(), ErrorCode> {
     raft.sync(latest_commit).await
 }
 
-type PendingResponse = Sender<Result<RkyvGenericResponse, ErrorCode>>;
+type PendingResponse = Sender<Result<Response, ErrorCode>>;
 
 fn latest_applied_on_all_followers(node_id: u64, progress: &ProgressTracker) -> u64 {
     progress
@@ -286,7 +284,7 @@ impl RaftNode {
         request_data: Vec<u8>,
         pending_response: Option<PendingResponse>,
     ) -> Vec<(Vec<u8>, Option<PendingResponse>)> {
-        let request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(&request_data).unwrap();
+        let request = decode_request(&request_data).unwrap();
         let request_meta = request.meta_info();
 
         let mut lock_table = self.lock_table.lock().unwrap();
@@ -297,31 +295,24 @@ impl RaftNode {
                 lock_table.wait_for_lock(inode, (request_data, pending_response));
             } else {
                 match request {
-                    ArchivedRkyvRequest::Lock { inode } => {
-                        let lock_id = lock_table.lock(inode.into());
+                    Request::Lock { inode } => {
+                        let lock_id = lock_table.lock(inode);
                         if let Some(sender) = pending_response {
-                            sender
-                                .send(Ok(RkyvGenericResponse::Lock { lock_id }))
-                                .ok()
-                                .unwrap();
+                            sender.send(Ok(Response::Lock { lock_id })).ok().unwrap();
                         }
                     }
-                    ArchivedRkyvRequest::Unlock { inode, lock_id } => {
-                        let (mut requests, new_lock_id) =
-                            lock_table.unlock(inode.into(), lock_id.into());
+                    Request::Unlock { inode, lock_id } => {
+                        let (mut requests, new_lock_id) = lock_table.unlock(inode, lock_id);
                         if let Some(sender) = pending_response {
-                            sender.send(Ok(RkyvGenericResponse::Empty)).ok().unwrap();
+                            sender.send(Ok(Response::Empty)).ok().unwrap();
                         }
                         if let Some(id) = new_lock_id {
                             let (lock_request_data, pending) = requests.pop().unwrap();
-                            let lock_request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(
-                                &lock_request_data,
-                            )
-                            .unwrap();
-                            assert!(matches!(lock_request, ArchivedRkyvRequest::Lock { .. }));
+                            let lock_request = decode_request(&lock_request_data).unwrap();
+                            assert!(matches!(lock_request, Request::Lock { .. }));
                             if let Some(sender) = pending {
                                 sender
-                                    .send(Ok(RkyvGenericResponse::Lock { lock_id: id }))
+                                    .send(Ok(Response::Lock { lock_id: id }))
                                     .ok()
                                     .unwrap();
                             }
@@ -367,9 +358,9 @@ impl RaftNode {
             let to_process = self._process_lock_table(entry.data.to_vec(), pending_response);
 
             for (data, pending_response) in to_process {
-                let request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(&data).unwrap();
+                let request = decode_request(&data).unwrap();
                 if let Some(sender) = pending_response {
-                    match commit_write(request, &self.file_storage) {
+                    match commit_write(&request, &self.file_storage) {
                         Ok(response) => sender.send(Ok(response)).ok().unwrap(),
                         // TODO: handle this somehow. If not all nodes failed, then the filesystem
                         // is probably corrupted, since some will have applied the write, but not all
@@ -395,7 +386,7 @@ impl RaftNode {
                 } else {
                     // Replicas won't have a pending response to reply to, since the node
                     // that submitted the proposal will reply to the client.
-                    if let Err(error_code) = commit_write(request, &self.file_storage) {
+                    if let Err(error_code) = commit_write(&request, &self.file_storage) {
                         // TODO: handle this somehow. If not all nodes failed, then the filesystem
                         // is probably corrupted, since some will have applied the write, but not all.
                         // There should only be a few types of messages that can fail here. truncate is one,
@@ -547,8 +538,8 @@ impl RaftNode {
 
     pub fn propose(
         &self,
-        request: &RkyvRequest,
-    ) -> impl Future<Output = Result<RkyvGenericResponse, ErrorCode>> + use<> {
+        request: &Request<'_>,
+    ) -> impl Future<Output = Result<Response, ErrorCode>> + use<> {
         let uuid: u128 = rand::rng().random();
 
         let (sender, receiver) = oneshot::channel();
@@ -556,8 +547,7 @@ impl RaftNode {
             let mut pending_responses = self.pending_responses.lock().unwrap();
             pending_responses.insert(uuid, sender);
         }
-        let rkyv_bytes = rkyv::to_bytes::<rancor::Error>(request).unwrap();
-        self._propose(uuid, rkyv_bytes.to_vec());
+        self._propose(uuid, encode_request(request));
 
         self.process_raft_queue();
 
@@ -566,8 +556,8 @@ impl RaftNode {
 
     pub fn propose_raw(
         &self,
-        request: AlignedVec,
-    ) -> impl Future<Output = Result<RkyvGenericResponse, ErrorCode>> + use<> {
+        request: Vec<u8>,
+    ) -> impl Future<Output = Result<Response, ErrorCode>> + use<> {
         let uuid: u128 = rand::rng().random();
 
         let (sender, receiver) = oneshot::channel();
@@ -575,7 +565,7 @@ impl RaftNode {
             let mut pending_responses = self.pending_responses.lock().unwrap();
             pending_responses.insert(uuid, sender);
         }
-        self._propose(uuid, request.to_vec());
+        self._propose(uuid, request);
 
         self.process_raft_queue();
 

@@ -1,27 +1,25 @@
 use crate::base::{
-    ArchivedRkyvGenericResponse, EntryMetadata, ErrorCode, FileKind, InodeUidPair,
-    RkyvGenericResponse, RkyvRequest, UserContext,
+    EntryMetadata, ErrorCode, FileKind, InodeUidPair, Request, Response, UserContext, WireResponse,
+    encode_response,
 };
 use crate::base::{check_access, response_or_error};
 use crate::client::RemoteRaftGroups;
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
 use rand::Rng;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 async fn propose(
     inode: u64,
-    request: &RkyvRequest,
+    request: &Request<'_>,
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
-) -> Result<AlignedVec, ErrorCode> {
+) -> Result<Vec<u8>, ErrorCode> {
     if raft.inode_stored_locally(inode) {
-        let rkyv_response = raft.lookup_by_inode(inode).propose(request).await?;
-        let rkyv_bytes = rkyv::to_bytes::<rancor::Error>(&rkyv_response).unwrap();
-        response_or_error(&rkyv_bytes)?;
-        Ok(rkyv_bytes)
+        let response = raft.lookup_by_inode(inode).propose(request).await?;
+        let response_bytes = encode_response(&response);
+        response_or_error(&response_bytes)?;
+        Ok(response_bytes)
     } else {
         let response = remote_rafts
             .propose(inode, request)
@@ -43,9 +41,9 @@ async fn replace_link(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) -> Result<u64, ErrorCode> {
-    let request = RkyvRequest::ReplaceLink {
+    let request = Request::ReplaceLink {
         parent,
-        name: name.to_string(),
+        name,
         new_inode,
         kind,
         lock_id: Some(lock_id),
@@ -66,17 +64,17 @@ async fn remove_link(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) -> Result<(u64, bool), ErrorCode> {
-    let request = RkyvRequest::RemoveLink {
+    let request = Request::RemoveLink {
         parent,
-        name: name.to_string(),
+        name,
         link_inode_and_uid: link_inode_and_uid.map(|(inode, uid)| InodeUidPair::new(inode, uid)),
         lock_id,
         context,
     };
     let response_data = propose(parent, &request, raft, remote_rafts).await?;
     let response = response_or_error(&response_data)?;
-    if let ArchivedRkyvGenericResponse::RemovedInode { id, complete } = response {
-        Ok((id.into(), *complete))
+    if let WireResponse::RemovedInode { id, complete } = response {
+        Ok((id, complete))
     } else {
         unreachable!();
     }
@@ -88,10 +86,10 @@ async fn lock_inode(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) -> Result<u64, ErrorCode> {
-    let response_data = propose(inode, &RkyvRequest::Lock { inode }, raft, remote_rafts).await?;
+    let response_data = propose(inode, &Request::Lock { inode }, raft, remote_rafts).await?;
     let response = response_or_error(&response_data)?;
-    if let ArchivedRkyvGenericResponse::Lock { lock_id } = response {
-        Ok(lock_id.into())
+    if let WireResponse::Lock { lock_id } = response {
+        Ok(lock_id)
     } else {
         unreachable!();
     }
@@ -104,7 +102,7 @@ async fn update_parent(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) -> Result<(), ErrorCode> {
-    let request = RkyvRequest::UpdateParent {
+    let request = Request::UpdateParent {
         inode,
         new_parent,
         lock_id,
@@ -124,7 +122,7 @@ async fn update_metadata_changed_time(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) -> Result<(), ErrorCode> {
-    let request = RkyvRequest::UpdateMetadataChangedTime { inode, lock_id };
+    let request = Request::UpdateMetadataChangedTime { inode, lock_id };
 
     let response_data = propose(inode, &request, raft, remote_rafts).await?;
     response_or_error(&response_data)?
@@ -142,7 +140,7 @@ async fn unlock_inode(
 ) -> Result<(), ErrorCode> {
     let response_data = propose(
         inode,
-        &RkyvRequest::Unlock { inode, lock_id },
+        &Request::Unlock { inode, lock_id },
         raft,
         remote_rafts,
     )
@@ -192,14 +190,14 @@ async fn getattrs(
 
         let response = raft.lookup_by_inode(inode).file_storage().getattr(inode)?;
         match response {
-            RkyvGenericResponse::EntryMetadata(metadata) => Ok(FileOrDirAttrs::new(&metadata)),
+            Response::EntryMetadata(metadata) => Ok(FileOrDirAttrs::new(&metadata)),
             _ => Err(ErrorCode::BadResponse),
         }
     } else {
-        let rkyv_request = RkyvRequest::GetAttr { inode };
+        let request = Request::GetAttr { inode };
 
         let response_data = remote_rafts
-            .forward_request(&rkyv_request)
+            .forward_request(&request)
             .await
             .map_err(|_| ErrorCode::Uncategorized)?;
 
@@ -213,7 +211,7 @@ async fn getattrs(
 // TODO: even these read-only RPCs add a significant performance cost. Maybe they can be optimized?
 async fn lookup(
     parent: u64,
-    name: String,
+    name: &str,
     context: UserContext,
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
@@ -226,15 +224,15 @@ async fn lookup(
         let inode_response = raft
             .lookup_by_inode(parent)
             .file_storage()
-            .lookup(parent, &name, context)?;
+            .lookup(parent, name, context)?;
 
         match inode_response {
-            RkyvGenericResponse::Inode { id } => Ok(id),
+            Response::Inode { id } => Ok(id),
             _ => Err(ErrorCode::BadResponse),
         }
     } else {
         let response_data = remote_rafts
-            .forward_request(&RkyvRequest::Lookup {
+            .forward_request(&Request::Lookup {
                 parent,
                 name,
                 context,
@@ -255,7 +253,7 @@ async fn decrement_inode(
     raft: &LocalRaftGroupManager,
     remote_rafts: &RemoteRaftGroups,
 ) {
-    let request = RkyvRequest::DecrementInode {
+    let request = Request::DecrementInode {
         inode,
         decrement_count: count,
         lock_id,
@@ -357,7 +355,7 @@ pub async fn rename_transaction(
     context: UserContext,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     let locks: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
     let result = rename_transaction_lock_context(
         parent,
@@ -391,7 +389,7 @@ async fn rename_transaction_lock_context(
     lock_guard: Arc<Mutex<HashSet<(u64, u64)>>>,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     // TODO: since we acquire multiple locks in this function it could cause a deadlock.
     // We should acquire them in ascending order of inode
     let parent_lock_id = lock_inode(parent, &raft, &remote_rafts).await?;
@@ -405,28 +403,21 @@ async fn rename_transaction_lock_context(
         parent_lock_id
     };
 
-    let inode = lookup(parent, name.to_string(), context, &raft, &remote_rafts).await?;
+    let inode = lookup(parent, name, context, &raft, &remote_rafts).await?;
     let inode_lock_id = lock_inode(inode, &raft, &remote_rafts).await?;
     lock_guard.lock().unwrap().insert((inode, inode_lock_id));
 
-    let existing_dest_inode = match lookup(
-        new_parent,
-        new_name.to_string(),
-        context,
-        &raft,
-        &remote_rafts,
-    )
-    .await
-    {
-        Ok(inode) => Some(inode),
-        Err(error_code) => {
-            if error_code == ErrorCode::DoesNotExist {
-                None
-            } else {
-                return Err(error_code);
+    let existing_dest_inode =
+        match lookup(new_parent, new_name, context, &raft, &remote_rafts).await {
+            Ok(inode) => Some(inode),
+            Err(error_code) => {
+                if error_code == ErrorCode::DoesNotExist {
+                    None
+                } else {
+                    return Err(error_code);
+                }
             }
-        }
-    };
+        };
     let existing_inode_lock_id = if let Some(inode) = existing_dest_inode {
         let lock_id = lock_inode(inode, &raft, &remote_rafts).await?;
         lock_guard.lock().unwrap().insert((inode, lock_id));
@@ -472,9 +463,9 @@ async fn rename_transaction_lock_context(
             decrement_inode(old_inode, 1, existing_inode_lock_id, &raft, &remote_rafts).await;
         }
     } else {
-        let create_link = RkyvRequest::CreateLink {
+        let create_link = Request::CreateLink {
             parent: new_parent,
-            name: new_name.to_string(),
+            name: new_name,
             inode,
             kind: inode_attrs.kind,
             lock_id: Some(new_parent_lock_id),
@@ -502,7 +493,7 @@ async fn rename_transaction_lock_context(
     }
     update_metadata_changed_time(inode, Some(inode_lock_id), &raft, &remote_rafts).await?;
 
-    Ok(RkyvGenericResponse::Empty)
+    Ok(Response::Empty)
 }
 
 // TODO: persist transaction state, so that it doesn't get lost if the coordinating machine dies
@@ -513,8 +504,8 @@ pub async fn rmdir_transaction(
     context: UserContext,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
-    let mut inode = lookup(parent, name.to_string(), context, &raft, &remote_rafts).await?;
+) -> Result<Response, ErrorCode> {
+    let mut inode = lookup(parent, name, context, &raft, &remote_rafts).await?;
     let mut complete = false;
     while !complete {
         // If the link removal didn't complete successful or with an error, then we need to
@@ -559,7 +550,7 @@ pub async fn rmdir_transaction(
     let hardlinks = getattrs(inode, &raft, &remote_rafts).await?.hardlinks;
     assert_eq!(hardlinks, 2);
 
-    let decrement_link_count = RkyvRequest::DecrementInode {
+    let decrement_link_count = Request::DecrementInode {
         inode,
         decrement_count: 2,
         lock_id: None,
@@ -568,7 +559,7 @@ pub async fn rmdir_transaction(
     let response_data = propose(inode, &decrement_link_count, &raft, &remote_rafts).await?;
     response_or_error(&response_data)?;
 
-    Ok(RkyvGenericResponse::Empty)
+    Ok(Response::Empty)
 }
 
 // TODO: persist transaction state, so that it doesn't get lost if the coordinating machine dies
@@ -579,14 +570,14 @@ pub async fn unlink_transaction(
     context: UserContext,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     // Try to remove the link. The result of this might be indeterminate, since "sticky bit"
     // can require that we know the uid of the inode
     let (link_inode, complete) =
         remove_link(parent, name, None, None, context, &raft, &remote_rafts).await?;
 
     if complete {
-        let decrement_link_count = RkyvRequest::DecrementInode {
+        let decrement_link_count = Request::DecrementInode {
             inode: link_inode,
             decrement_count: 1,
             lock_id: None,
@@ -632,7 +623,7 @@ pub async fn unlink_transaction(
                 }
             }
         }
-        let decrement_link_count = RkyvRequest::DecrementInode {
+        let decrement_link_count = Request::DecrementInode {
             inode,
             decrement_count: 1,
             lock_id: None,
@@ -642,7 +633,7 @@ pub async fn unlink_transaction(
         response_or_error(&response_data)?;
     }
 
-    Ok(RkyvGenericResponse::Empty)
+    Ok(Response::Empty)
 }
 
 // TODO: persist transaction state, so that it doesn't get lost if the coordinating machine dies
@@ -657,11 +648,11 @@ pub async fn create_transaction(
     kind: FileKind,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     // First create inode. This effectively begins the transaction.
     // TODO: actually load balance
     let raft_group = rand::rng().random_range(0..remote_rafts.get_total_raft_groups());
-    let create_inode = RkyvRequest::CreateInode {
+    let create_inode = Request::CreateInode {
         raft_group,
         parent,
         uid,
@@ -684,12 +675,12 @@ pub async fn create_transaction(
     let inode = created_inode_response.inode;
     let link_count = created_inode_response.hard_links;
     // TODO: optimize out deserialize
-    let client_response = RkyvGenericResponse::EntryMetadata(created_inode_response);
+    let client_response = Response::EntryMetadata(created_inode_response);
 
     // Second create the link
-    let create_link = RkyvRequest::CreateLink {
+    let create_link = Request::CreateLink {
         parent,
-        name: name.to_string(),
+        name,
         inode,
         kind,
         lock_id: None,
@@ -703,7 +694,7 @@ pub async fn create_transaction(
         }
         Err(error_code) => {
             // Rollback the transaction
-            let rollback = RkyvRequest::DecrementInode {
+            let rollback = Request::DecrementInode {
                 inode,
                 decrement_count: link_count,
                 lock_id: None,
@@ -725,15 +716,15 @@ pub async fn hardlink_transaction(
     context: UserContext,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
-) -> Result<RkyvGenericResponse, ErrorCode> {
+) -> Result<Response, ErrorCode> {
     // First increment the link count on the inode to ensure it can't be deleted
     // this effectively begins the transaction.
-    let increment = RkyvRequest::HardlinkIncrement { inode };
+    let increment = Request::HardlinkIncrement { inode };
 
     let response_data = propose(inode, &increment, &raft, &remote_rafts).await?;
     let response = response_or_error(&response_data)?;
     let (rollback, attrs) = match response {
-        ArchivedRkyvGenericResponse::HardlinkTransaction {
+        WireResponse::HardlinkTransaction {
             rollback_last_modified,
             attrs,
         } => (rollback_last_modified, attrs),
@@ -741,18 +732,18 @@ pub async fn hardlink_transaction(
     };
 
     // Second create the new link
-    let create_link = RkyvRequest::CreateLink {
+    let create_link = Request::CreateLink {
         parent: new_parent,
-        name: new_name.to_string(),
+        name: new_name,
         inode,
-        kind: (&attrs.kind).into(),
+        kind: attrs.kind,
         lock_id: None,
         context,
     };
 
-    let rollback_request = RkyvRequest::HardlinkRollback {
+    let rollback_request = Request::HardlinkRollback {
         inode,
-        last_modified_time: rollback.into(),
+        last_modified_time: rollback,
     };
 
     match propose(new_parent, &create_link, &raft, &remote_rafts).await {
@@ -766,8 +757,7 @@ pub async fn hardlink_transaction(
             }
 
             // This is the response back to the client
-            let entry = rkyv::deserialize::<EntryMetadata, rkyv::rancor::Error>(attrs).unwrap();
-            Ok(RkyvGenericResponse::EntryMetadata(entry))
+            Ok(Response::EntryMetadata(attrs))
         }
         Err(error_code) => {
             // Rollback the transaction

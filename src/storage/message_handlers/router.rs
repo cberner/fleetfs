@@ -1,6 +1,6 @@
 use crate::base::DistributionRequirement;
-use crate::base::{ArchivedRkyvRequest, CommitId, FileKind};
-use crate::base::{ErrorCode, RkyvGenericResponse};
+use crate::base::{CommitId, FileKind, Request, decode_request, encode_response};
+use crate::base::{ErrorCode, Response};
 use crate::base::{LocalContext, RequestMetaInfo};
 use crate::client::RemoteRaftGroups;
 use crate::storage::message_handlers::fsck_handler::{checksum_request, fsck};
@@ -12,13 +12,10 @@ use crate::storage::raft_group_manager::LocalRaftGroupManager;
 use crate::storage::raft_node::sync_with_leader;
 use protobuf::Message as ProtobufMessage;
 use raft::prelude::Message;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
 use std::sync::Arc;
 
-pub fn to_error_response(error_code: ErrorCode) -> AlignedVec {
-    let rkyv_response = RkyvGenericResponse::ErrorOccurred(error_code);
-    rkyv::to_bytes::<rancor::Error>(&rkyv_response).unwrap()
+pub fn to_error_response(error_code: ErrorCode) -> Vec<u8> {
+    encode_response(&Response::ErrorOccurred(error_code))
 }
 
 // Determines whether the request can be handled by the local node, or whether it needs to be
@@ -40,10 +37,10 @@ fn can_handle_locally(request_meta: &RequestMetaInfo, local_rafts: &LocalRaftGro
 }
 
 async fn forward_request(
-    request: AlignedVec,
+    request: Vec<u8>,
     meta: RequestMetaInfo,
     rafts: Arc<RemoteRaftGroups>,
-) -> AlignedVec {
+) -> Vec<u8> {
     match rafts.forward_raw_request(request, meta).await {
         Ok(response) => response,
         _ => to_error_response(ErrorCode::Uncategorized),
@@ -51,35 +48,32 @@ async fn forward_request(
 }
 
 pub async fn request_router(
-    aligned: AlignedVec,
+    request_data: Vec<u8>,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
     context: LocalContext,
-) -> AlignedVec {
-    let request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(&aligned).unwrap();
-    let meta = request.meta_info();
+) -> Vec<u8> {
+    let meta = decode_request(&request_data).unwrap().meta_info();
     if !can_handle_locally(&meta, &raft) {
-        return forward_request(aligned, meta, remote_rafts.clone()).await;
+        return forward_request(request_data, meta, remote_rafts.clone()).await;
     }
 
-    match request_router_inner(aligned, raft, remote_rafts, context).await {
-        Ok(rkyv_response) => {
-            // TODO: optimize Read responses to avoid copying all the data. We should just take the .data Vec and write it out
-            rkyv::to_bytes::<rancor::Error>(&rkyv_response).unwrap()
-        }
+    match request_router_inner(request_data, raft, remote_rafts, context).await {
+        // TODO: optimize Read responses to avoid copying all the data. We should just take the .data Vec and write it out
+        Ok(response) => encode_response(&response),
         Err(error_code) => to_error_response(error_code),
     }
 }
 
 async fn request_router_inner(
-    aligned: AlignedVec,
+    request_data: Vec<u8>,
     raft: Arc<LocalRaftGroupManager>,
     remote_rafts: Arc<RemoteRaftGroups>,
     context: LocalContext,
-) -> Result<RkyvGenericResponse, ErrorCode> {
-    let request = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(&aligned).unwrap();
+) -> Result<Response, ErrorCode> {
+    let request = decode_request(&request_data).unwrap();
     match request {
-        ArchivedRkyvRequest::FilesystemReady => {
+        Request::FilesystemReady => {
             for node in raft.all_groups() {
                 node.get_leader().await?;
             }
@@ -89,113 +83,82 @@ async fn request_router_inner(
                 .await
                 .map_err(|_| ErrorCode::Uncategorized)?;
 
-            Ok(RkyvGenericResponse::Empty)
+            Ok(Response::Empty)
         }
-        ArchivedRkyvRequest::FilesystemInformation => {
+        Request::FilesystemInformation => {
             Ok(raft.all_groups().next().unwrap().file_storage().statfs())
         }
-        ArchivedRkyvRequest::FilesystemCheck => fsck(context.clone(), raft.clone()).await,
-        ArchivedRkyvRequest::FilesystemChecksum => checksum_request(raft.clone()).await,
-        ArchivedRkyvRequest::CreateInode { raft_group, .. } => {
+        Request::FilesystemCheck => fsck(context.clone(), raft.clone()).await,
+        Request::FilesystemChecksum => checksum_request(raft.clone()).await,
+        Request::CreateInode { raft_group, .. } => {
             // Internal request used during transaction processing
-            raft.lookup_by_raft_group(raft_group.into())
-                .propose_raw(aligned)
+            raft.lookup_by_raft_group(raft_group)
+                .propose_raw(request_data)
                 .await
         }
-        ArchivedRkyvRequest::CreateLink { parent: inode, .. }
-        | ArchivedRkyvRequest::RemoveLink { parent: inode, .. }
-        | ArchivedRkyvRequest::ReplaceLink { parent: inode, .. }
-        | ArchivedRkyvRequest::HardlinkRollback { inode, .. }
-        | ArchivedRkyvRequest::HardlinkIncrement { inode }
-        | ArchivedRkyvRequest::DecrementInode { inode, .. }
-        | ArchivedRkyvRequest::UpdateParent { inode, .. }
-        | ArchivedRkyvRequest::UpdateMetadataChangedTime { inode, .. } => {
+        Request::CreateLink { parent: inode, .. }
+        | Request::RemoveLink { parent: inode, .. }
+        | Request::ReplaceLink { parent: inode, .. }
+        | Request::HardlinkRollback { inode, .. }
+        | Request::HardlinkIncrement { inode }
+        | Request::DecrementInode { inode, .. }
+        | Request::UpdateParent { inode, .. }
+        | Request::UpdateMetadataChangedTime { inode, .. } => {
             // Internal request used during transaction processing
-            raft.lookup_by_inode(inode.into())
-                .propose_raw(aligned)
-                .await
+            raft.lookup_by_inode(inode).propose_raw(request_data).await
         }
-        ArchivedRkyvRequest::Write { inode, .. }
-        | ArchivedRkyvRequest::Lock { inode }
-        | ArchivedRkyvRequest::Unlock { inode, .. }
-        | ArchivedRkyvRequest::Fsync { inode }
-        | ArchivedRkyvRequest::Chmod { inode, .. }
-        | ArchivedRkyvRequest::Chown { inode, .. }
-        | ArchivedRkyvRequest::Truncate { inode, .. }
-        | ArchivedRkyvRequest::SetXattr { inode, .. }
-        | ArchivedRkyvRequest::RemoveXattr { inode, .. }
-        | ArchivedRkyvRequest::Utimens { inode, .. } => {
-            raft.lookup_by_inode(inode.into())
-                .propose_raw(aligned)
-                .await
+        Request::Write { inode, .. }
+        | Request::Lock { inode }
+        | Request::Unlock { inode, .. }
+        | Request::Fsync { inode }
+        | Request::Chmod { inode, .. }
+        | Request::Chown { inode, .. }
+        | Request::Truncate { inode, .. }
+        | Request::SetXattr { inode, .. }
+        | Request::RemoveXattr { inode, .. }
+        | Request::Utimens { inode, .. } => {
+            raft.lookup_by_inode(inode).propose_raw(request_data).await
         }
-        ArchivedRkyvRequest::Unlink {
+        Request::Unlink {
             parent,
             name,
             context,
-        } => {
-            unlink_transaction(
-                parent.into(),
-                name.as_str(),
-                context.into(),
-                raft.clone(),
-                remote_rafts.clone(),
-            )
-            .await
-        }
-        ArchivedRkyvRequest::Read {
+        } => unlink_transaction(parent, name, context, raft.clone(), remote_rafts.clone()).await,
+        Request::Read {
             inode,
             offset,
             read_size,
         } => {
             let latest_commit = raft
-                .lookup_by_inode(inode.into())
+                .lookup_by_inode(inode)
                 .get_latest_commit_from_leader()
                 .await?;
-            raft.lookup_by_inode(inode.into())
-                .sync(latest_commit)
-                .await?;
-            raft.lookup_by_inode(inode.into())
+            raft.lookup_by_inode(inode).sync(latest_commit).await?;
+            raft.lookup_by_inode(inode)
                 .file_storage()
                 // TODO: Use the real term, not zero
-                .read(
-                    inode.into(),
-                    offset.into(),
-                    read_size.into(),
-                    CommitId::new(0, latest_commit),
-                )
+                .read(inode, offset, read_size, CommitId::new(0, latest_commit))
                 .await
         }
-        ArchivedRkyvRequest::ReadRaw {
+        Request::ReadRaw {
             inode,
             required_commit,
             offset,
             read_size,
         } => {
-            raft.lookup_by_inode(inode.into())
-                .sync(required_commit.index.into())
+            raft.lookup_by_inode(inode)
+                .sync(required_commit.index)
                 .await?;
-            raft.lookup_by_inode(inode.into()).file_storage().read_raw(
-                inode.into(),
-                offset.into(),
-                read_size.into(),
-            )
+            raft.lookup_by_inode(inode)
+                .file_storage()
+                .read_raw(inode, offset, read_size)
         }
-        ArchivedRkyvRequest::Rmdir {
+        Request::Rmdir {
             parent,
             name,
             context,
-        } => {
-            rmdir_transaction(
-                parent.into(),
-                name.as_str(),
-                context.into(),
-                raft.clone(),
-                remote_rafts.clone(),
-            )
-            .await
-        }
-        ArchivedRkyvRequest::Mkdir {
+        } => rmdir_transaction(parent, name, context, raft.clone(), remote_rafts.clone()).await,
+        Request::Mkdir {
             parent,
             name,
             uid,
@@ -203,18 +166,18 @@ async fn request_router_inner(
             mode,
         } => {
             create_transaction(
-                parent.into(),
-                name.as_str(),
-                uid.into(),
-                gid.into(),
-                mode.into(),
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
                 FileKind::Directory,
                 raft.clone(),
                 remote_rafts.clone(),
             )
             .await
         }
-        ArchivedRkyvRequest::Create {
+        Request::Create {
             parent,
             name,
             uid,
@@ -223,58 +186,54 @@ async fn request_router_inner(
             kind,
         } => {
             create_transaction(
-                parent.into(),
-                name.as_str(),
-                uid.into(),
-                gid.into(),
-                mode.into(),
-                kind.into(),
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
+                kind,
                 raft.clone(),
                 remote_rafts.clone(),
             )
             .await
         }
-        ArchivedRkyvRequest::Lookup {
+        Request::Lookup {
             parent,
             name,
             context,
         } => {
-            sync_with_leader(raft.lookup_by_inode(parent.into())).await?;
-            raft.lookup_by_inode(parent.into()).file_storage().lookup(
-                parent.into(),
-                name.as_str(),
-                context.into(),
-            )
+            sync_with_leader(raft.lookup_by_inode(parent)).await?;
+            raft.lookup_by_inode(parent)
+                .file_storage()
+                .lookup(parent, name, context)
         }
-        ArchivedRkyvRequest::GetXattr {
+        Request::GetXattr {
             inode,
             key,
             context,
         } => {
-            sync_with_leader(raft.lookup_by_inode(inode.into())).await?;
-            raft.lookup_by_inode(inode.into()).file_storage().get_xattr(
-                inode.into(),
-                key.as_str(),
-                context.into(),
-            )
+            sync_with_leader(raft.lookup_by_inode(inode)).await?;
+            raft.lookup_by_inode(inode)
+                .file_storage()
+                .get_xattr(inode, key, context)
         }
-        ArchivedRkyvRequest::Hardlink {
+        Request::Hardlink {
             inode,
             new_parent,
             new_name,
             context,
         } => {
             hardlink_transaction(
-                inode.into(),
-                new_parent.into(),
-                new_name.as_str(),
-                context.into(),
+                inode,
+                new_parent,
+                new_name,
+                context,
                 raft.clone(),
                 remote_rafts.clone(),
             )
             .await
         }
-        ArchivedRkyvRequest::Rename {
+        Request::Rename {
             parent,
             name,
             new_parent,
@@ -282,54 +241,49 @@ async fn request_router_inner(
             context,
         } => {
             rename_transaction(
-                parent.into(),
-                name.as_str(),
-                new_parent.into(),
-                new_name.as_str(),
-                context.into(),
+                parent,
+                name,
+                new_parent,
+                new_name,
+                context,
                 raft.clone(),
                 remote_rafts.clone(),
             )
             .await
         }
-        ArchivedRkyvRequest::GetAttr { inode } => {
-            let inode = inode.into();
+        Request::GetAttr { inode } => {
             sync_with_leader(raft.lookup_by_inode(inode)).await?;
             raft.lookup_by_inode(inode).file_storage().getattr(inode)
         }
-        ArchivedRkyvRequest::ListDir { inode } => {
-            let inode = inode.into();
+        Request::ListDir { inode } => {
             sync_with_leader(raft.lookup_by_inode(inode)).await?;
             raft.lookup_by_inode(inode).file_storage().readdir(inode)
         }
-        ArchivedRkyvRequest::ListXattrs { inode } => {
-            let inode: u64 = inode.into();
+        Request::ListXattrs { inode } => {
             sync_with_leader(raft.lookup_by_inode(inode)).await?;
             raft.lookup_by_inode(inode)
                 .file_storage()
                 .list_xattrs(inode)
         }
-        ArchivedRkyvRequest::LatestCommit { raft_group } => {
+        Request::LatestCommit { raft_group } => {
             let index = raft
-                .lookup_by_raft_group(raft_group.into())
+                .lookup_by_raft_group(raft_group)
                 .get_latest_local_commit();
-            Ok(RkyvGenericResponse::LatestCommit { term: 0, index })
+            Ok(Response::LatestCommit { term: 0, index })
         }
-        ArchivedRkyvRequest::RaftGroupLeader { raft_group } => {
-            let rgroup = raft.lookup_by_raft_group(raft_group.into());
+        Request::RaftGroupLeader { raft_group } => {
+            let rgroup = raft.lookup_by_raft_group(raft_group);
             let leader = rgroup.get_leader().await?;
 
-            Ok(RkyvGenericResponse::NodeId { id: leader })
+            Ok(Response::NodeId { id: leader })
         }
-        ArchivedRkyvRequest::RaftMessage { raft_group, data } => {
+        Request::RaftMessage { raft_group, data } => {
             let mut deserialized_message = Message::new();
-            deserialized_message
-                .merge_from_bytes(data.as_slice())
-                .unwrap();
-            raft.lookup_by_raft_group(raft_group.into())
+            deserialized_message.merge_from_bytes(data).unwrap();
+            raft.lookup_by_raft_group(raft_group)
                 .apply_messages(&[deserialized_message])
                 .unwrap();
-            Ok(RkyvGenericResponse::Empty)
+            Ok(Response::Empty)
         }
     }
 }

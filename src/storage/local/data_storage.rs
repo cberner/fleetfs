@@ -310,7 +310,6 @@ mod tests {
     use futures_util::future::FutureExt;
     use raft::eraftpb::Message;
     use rand::Rng;
-    use rkyv::util::AlignedVec;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::fs;
@@ -443,7 +442,7 @@ mod tests {
         fn send_raw<T: AsRef<[u8]> + Send + 'static>(
             &self,
             _data: T,
-        ) -> BoxFuture<'static, Result<AlignedVec, Error>> {
+        ) -> BoxFuture<'static, Result<Vec<u8>, Error>> {
             unimplemented!()
         }
 

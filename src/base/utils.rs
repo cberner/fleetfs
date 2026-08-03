@@ -1,13 +1,11 @@
 use crate::base::ErrorCode;
-use crate::base::message_types::ArchivedRkyvGenericResponse;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
+use crate::base::message_types::{ResponseView, decode_response};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 
-pub fn response_or_error(buffer: &AlignedVec) -> Result<&ArchivedRkyvGenericResponse, ErrorCode> {
-    let response = rkyv::access::<ArchivedRkyvGenericResponse, rancor::Error>(buffer).unwrap();
+pub fn response_or_error(buffer: &[u8]) -> Result<ResponseView<'_>, ErrorCode> {
+    let response = decode_response(buffer).unwrap();
     if let Some(error_code) = response.as_error_response() {
         Err(error_code)
     } else {

@@ -1,11 +1,9 @@
 use crate::base::LocalContext;
 use crate::base::RequestMetaInfo;
 use crate::base::node_contains_raft_group;
-use crate::base::{ArchivedRkyvRequest, RkyvRequest};
+use crate::base::{Request, encode_request};
 use crate::client::{PeerClient, TcpPeerClient};
 use futures_util::future::FutureExt;
-use rkyv::rancor;
-use rkyv::util::AlignedVec;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -62,7 +60,7 @@ impl RemoteRaftGroups {
     pub fn wait_for_ready(&self) -> impl Future<Output = Result<(), std::io::Error>> + use<> {
         let mut group_futures = vec![];
         for (group, client) in self.groups.iter() {
-            let group_future = client.send(&RkyvRequest::RaftGroupLeader { raft_group: *group });
+            let group_future = client.send(&Request::RaftGroupLeader { raft_group: *group });
             group_futures.push(group_future);
         }
 
@@ -78,8 +76,8 @@ impl RemoteRaftGroups {
     pub fn propose(
         &self,
         inode: u64,
-        request: &RkyvRequest,
-    ) -> impl Future<Output = Result<AlignedVec, std::io::Error>> + use<> {
+        request: &Request<'_>,
+    ) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + use<> {
         let raft_group_id = inode % self.total_raft_groups as u64;
         self.groups
             .get(&(raft_group_id as u16))
@@ -90,29 +88,28 @@ impl RemoteRaftGroups {
     pub fn propose_to_specific_group(
         &self,
         raft_group: u16,
-        request: &RkyvRequest,
-    ) -> impl Future<Output = Result<AlignedVec, std::io::Error>> + use<> {
+        request: &Request<'_>,
+    ) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + use<> {
         self.groups.get(&raft_group).unwrap().send(request)
     }
 
     pub fn forward_request(
         &self,
-        request: &RkyvRequest,
-    ) -> impl Future<Output = Result<AlignedVec, std::io::Error>> + use<> {
-        let rkyv_bytes = rkyv::to_bytes::<rancor::Error>(request).unwrap();
-        let serialized = rkyv::access::<ArchivedRkyvRequest, rancor::Error>(&rkyv_bytes).unwrap();
-        let raft_group_id = serialized.meta_info().inode.unwrap() % self.total_raft_groups as u64;
+        request: &Request<'_>,
+    ) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + use<> {
+        let request_bytes = encode_request(request);
+        let raft_group_id = request.meta_info().inode.unwrap() % self.total_raft_groups as u64;
         self.groups
             .get(&(raft_group_id as u16))
             .unwrap()
-            .send_raw(rkyv_bytes)
+            .send_raw(request_bytes)
     }
 
     pub fn forward_raw_request(
         &self,
-        request: AlignedVec,
+        request: Vec<u8>,
         meta: RequestMetaInfo,
-    ) -> impl Future<Output = Result<AlignedVec, std::io::Error>> + use<> {
+    ) -> impl Future<Output = Result<Vec<u8>, std::io::Error>> + use<> {
         let raft_group_id = meta.inode.unwrap() % self.total_raft_groups as u64;
         self.groups
             .get(&(raft_group_id as u16))
