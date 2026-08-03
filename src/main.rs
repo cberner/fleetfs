@@ -222,13 +222,10 @@ fn main() -> Result<(), ErrorCode> {
         client.filesystem_ready()?;
         println!("Filesystem ready");
     } else if mount_point.is_empty() {
-        println!("Starting with peers: {:?}", &peers);
+        println!("Starting with peers: {peers:?}");
         Node::new(&data_dir, bind_address, peers, replicas_per_raft_group).run();
     } else {
-        println!(
-            "Connecting to server {} and mounting FUSE at {}",
-            &server_ip_port, &mount_point
-        );
+        println!("Connecting to server {server_ip_port} and mounting FUSE at {mount_point}");
         let options = vec![
             MountOption::FSName("fleetfs".to_string()),
             MountOption::AutoUnmount,

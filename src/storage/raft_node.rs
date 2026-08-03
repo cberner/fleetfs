@@ -129,7 +129,7 @@ impl RaftNode {
 
         let path = Path::new(&context.data_dir).join(format!("rgroup_{raft_group_id}"));
         #[allow(clippy::expect_fun_call)]
-        fs::create_dir_all(&path).expect(&format!("Failed to create storage dir: {:?}", &path));
+        fs::create_dir_all(&path).expect(&format!("Failed to create storage dir: {path:?}"));
 
         let peer_addresses: Vec<SocketAddr> = context
             .peers

@@ -189,7 +189,7 @@ impl MetadataStorage {
 
     fn durability_tick(&self) -> bool {
         let count = self.durability_counter.fetch_add(1, Ordering::AcqRel);
-        count % 100 == 0
+        count.is_multiple_of(100)
     }
 
     pub(super) fn non_directory_inodes(&self) -> Result<Vec<u64>, ErrorCode> {

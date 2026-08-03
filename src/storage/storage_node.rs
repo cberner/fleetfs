@@ -75,8 +75,7 @@ impl Node {
     ) -> Node {
         let data_dir = Path::new(node_dir).join("data");
         #[allow(clippy::expect_fun_call)]
-        fs::create_dir_all(&data_dir)
-            .expect(&format!("Failed to create data dir: {:?}", &data_dir));
+        fs::create_dir_all(&data_dir).expect(&format!("Failed to create data dir: {data_dir:?}"));
         // Unique ID of node within the cluster. Never 0.
         let node_id = node_id_from_address(&bind_address);
         let context = LocalContext::new(
