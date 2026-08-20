@@ -9,9 +9,6 @@ use crate::storage::message_handlers::transaction_coordinator::{
     unlink_transaction,
 };
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
-use crate::storage::raft_node::sync_with_leader;
-use protobuf::Message as ProtobufMessage;
-use raft::prelude::Message;
 use std::sync::Arc;
 
 pub fn to_error_response(error_code: ErrorCode) -> Vec<u8> {
@@ -74,8 +71,10 @@ async fn request_router_inner(
     let request = decode_request(&request_data).unwrap();
     match request {
         Request::FilesystemReady => {
+            // Committing a barrier requires a full consensus round, so this
+            // only reports ready once each local group has a live quorum.
             for node in raft.all_groups() {
-                node.get_leader().await?;
+                node.read_barrier().await?;
             }
             // Ensure that all other nodes are ready too
             remote_rafts
@@ -129,11 +128,8 @@ async fn request_router_inner(
             offset,
             read_size,
         } => {
-            let latest_commit = raft
-                .lookup_by_inode(inode)
-                .get_latest_commit_from_leader()
-                .await?;
-            raft.lookup_by_inode(inode).sync(latest_commit).await?;
+            raft.lookup_by_inode(inode).read_barrier().await?;
+            let latest_commit = raft.lookup_by_inode(inode).get_latest_local_commit();
             raft.lookup_by_inode(inode)
                 .file_storage()
                 // TODO: Use the real term, not zero
@@ -202,7 +198,7 @@ async fn request_router_inner(
             name,
             context,
         } => {
-            sync_with_leader(raft.lookup_by_inode(parent)).await?;
+            raft.lookup_by_inode(parent).read_barrier().await?;
             raft.lookup_by_inode(parent)
                 .file_storage()
                 .lookup(parent, name, context)
@@ -212,7 +208,7 @@ async fn request_router_inner(
             key,
             context,
         } => {
-            sync_with_leader(raft.lookup_by_inode(inode)).await?;
+            raft.lookup_by_inode(inode).read_barrier().await?;
             raft.lookup_by_inode(inode)
                 .file_storage()
                 .get_xattr(inode, key, context)
@@ -252,15 +248,15 @@ async fn request_router_inner(
             .await
         }
         Request::GetAttr { inode } => {
-            sync_with_leader(raft.lookup_by_inode(inode)).await?;
+            raft.lookup_by_inode(inode).read_barrier().await?;
             raft.lookup_by_inode(inode).file_storage().getattr(inode)
         }
         Request::ListDir { inode } => {
-            sync_with_leader(raft.lookup_by_inode(inode)).await?;
+            raft.lookup_by_inode(inode).read_barrier().await?;
             raft.lookup_by_inode(inode).file_storage().readdir(inode)
         }
         Request::ListXattrs { inode } => {
-            sync_with_leader(raft.lookup_by_inode(inode)).await?;
+            raft.lookup_by_inode(inode).read_barrier().await?;
             raft.lookup_by_inode(inode)
                 .file_storage()
                 .list_xattrs(inode)
@@ -273,16 +269,13 @@ async fn request_router_inner(
         }
         Request::RaftGroupLeader { raft_group } => {
             let rgroup = raft.lookup_by_raft_group(raft_group);
+            rgroup.read_barrier().await?;
             let leader = rgroup.get_leader().await?;
 
             Ok(Response::NodeId { id: leader })
         }
-        Request::RaftMessage { raft_group, data } => {
-            let mut deserialized_message = Message::new();
-            deserialized_message.merge_from_bytes(data).unwrap();
-            raft.lookup_by_raft_group(raft_group)
-                .apply_messages(&[deserialized_message])
-                .unwrap();
+        Request::ConsensusMessage { raft_group, data } => {
+            raft.lookup_by_raft_group(raft_group).apply_message(data);
             Ok(Response::Empty)
         }
     }

@@ -308,7 +308,6 @@ mod tests {
     };
     use futures::future::{BoxFuture, ready};
     use futures_util::future::FutureExt;
-    use raft::eraftpb::Message;
     use rand::Rng;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -446,7 +445,11 @@ mod tests {
             unimplemented!()
         }
 
-        fn send_raft_message(&self, _raft_group: u16, _message: Message) -> BoxFuture<'static, ()> {
+        fn send_consensus_message(
+            &self,
+            _raft_group: u16,
+            _data: Vec<u8>,
+        ) -> BoxFuture<'static, ()> {
             unimplemented!()
         }
 

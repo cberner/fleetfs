@@ -462,7 +462,7 @@ pub enum Request<'a> {
         raft_group: u16,
     },
     #[variant(27)]
-    RaftMessage {
+    ConsensusMessage {
         #[n(0)]
         raft_group: u16,
         #[n(1)]
@@ -910,8 +910,8 @@ impl Debug for Request<'_> {
             Request::RaftGroupLeader { raft_group } => {
                 write!(f, "RaftGroupLeader: {raft_group}")
             }
-            Request::RaftMessage { raft_group, .. } => {
-                write!(f, "RaftMessage: {raft_group}")
+            Request::ConsensusMessage { raft_group, .. } => {
+                write!(f, "ConsensusMessage: {raft_group}")
             }
             Request::Lock { inode } => write!(f, "Lock: {inode}"),
             Request::Unlock { inode, lock_id } => {
@@ -1000,7 +1000,7 @@ impl Request<'_> {
             },
             Request::LatestCommit { raft_group }
             | Request::RaftGroupLeader { raft_group }
-            | Request::RaftMessage { raft_group, .. } => RequestMetaInfo {
+            | Request::ConsensusMessage { raft_group, .. } => RequestMetaInfo {
                 raft_group: Some(*raft_group),
                 inode: None,
                 lock_id: None,

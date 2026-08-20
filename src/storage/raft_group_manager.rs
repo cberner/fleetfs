@@ -1,6 +1,6 @@
 use crate::base::LocalContext;
 use crate::base::node_contains_raft_group;
-use crate::storage::raft_node::RaftNode;
+use crate::storage::raft_node::ConsensusNode;
 use std::collections::HashMap;
 
 // Manages all the local node's raft groups
@@ -8,7 +8,7 @@ pub struct LocalRaftGroupManager {
     context: LocalContext,
     total_raft_groups: u16,
     // Mapping of rgroup ids to instances
-    groups: HashMap<u16, RaftNode>,
+    groups: HashMap<u16, ConsensusNode>,
 }
 
 impl LocalRaftGroupManager {
@@ -22,7 +22,7 @@ impl LocalRaftGroupManager {
                 i,
                 context.replicas_per_raft_group,
             ) {
-                groups.insert(i, RaftNode::new(context.clone(), i, rgroups));
+                groups.insert(i, ConsensusNode::new(context.clone(), i, rgroups));
             }
         }
 
@@ -44,7 +44,7 @@ impl LocalRaftGroupManager {
         )
     }
 
-    pub fn all_groups(&self) -> impl Iterator<Item = &RaftNode> {
+    pub fn all_groups(&self) -> impl Iterator<Item = &ConsensusNode> {
         self.groups.values()
     }
 
@@ -52,11 +52,11 @@ impl LocalRaftGroupManager {
         self.groups.contains_key(&raft_group)
     }
 
-    pub fn lookup_by_raft_group(&self, raft_group: u16) -> &RaftNode {
+    pub fn lookup_by_raft_group(&self, raft_group: u16) -> &ConsensusNode {
         &self.groups[&raft_group]
     }
 
-    pub fn lookup_by_inode(&self, inode: u64) -> &RaftNode {
+    pub fn lookup_by_inode(&self, inode: u64) -> &ConsensusNode {
         let raft_group_id = (inode % self.total_raft_groups as u64) as u16;
         assert!(node_contains_raft_group(
             self.context.node_index(),

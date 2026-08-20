@@ -6,8 +6,6 @@ use crate::base::{CommitId, ErrorCode, Request, encode_request};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Either, ok, ready};
-use protobuf::Message as ProtobufMessage;
-use raft::eraftpb::Message;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +20,7 @@ pub trait PeerClient {
         data: T,
     ) -> BoxFuture<'static, Result<Vec<u8>, std::io::Error>>;
 
-    fn send_raft_message(&self, raft_group: u16, message: Message) -> BoxFuture<'static, ()>;
+    fn send_consensus_message(&self, raft_group: u16, data: Vec<u8>) -> BoxFuture<'static, ()>;
 
     fn get_latest_commit(&self, raft_group: u16)
     -> BoxFuture<'static, Result<u64, std::io::Error>>;
@@ -127,17 +125,16 @@ impl PeerClient for TcpPeerClient {
             .boxed()
     }
 
-    fn send_raft_message(&self, raft_group: u16, message: Message) -> BoxFuture<'static, ()> {
-        let serialized_message = message.write_to_bytes().unwrap();
+    fn send_consensus_message(&self, raft_group: u16, data: Vec<u8>) -> BoxFuture<'static, ()> {
         let ip_and_port = self.server_ip_port;
-        self.send(&Request::RaftMessage {
+        self.send(&Request::ConsensusMessage {
             raft_group,
-            data: &serialized_message,
+            data: &data,
         })
         .map(move |x| {
             if let Err(io_error) = x {
                 error!(
-                    "Error sending Raft message to {}: {}",
+                    "Error sending consensus message to {}: {}",
                     ip_and_port, io_error
                 );
             }
