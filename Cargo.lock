@@ -718,8 +718,9 @@ dependencies = [
 
 [[package]]
 name = "raxos"
-version = "0.0.0"
-source = "git+https://github.com/cberner/raxos.git?rev=36d7da4fce113c95b28f72437cf55e22b4bd87ad#36d7da4fce113c95b28f72437cf55e22b4bd87ad"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8707b5a3ede54741a80499cd67c097001a52318a9692b47a9d211520b3a389eb"
 
 [[package]]
 name = "redb"
@@ -1252,16 +1253,18 @@ dependencies = [
 
 [[package]]
 name = "zerialize"
-version = "0.0.0"
-source = "git+https://github.com/cberner/zerialize.git?rev=010423e23c7c086a819f53d4726aab41f3d62652#010423e23c7c086a819f53d4726aab41f3d62652"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8d447158ac47d1e0e2b4623167e7c2c29dac15fa86f3439ffd76c5c56ebf23c"
 dependencies = [
  "zerialize-macros",
 ]
 
 [[package]]
 name = "zerialize-macros"
-version = "0.0.0"
-source = "git+https://github.com/cberner/zerialize.git?rev=010423e23c7c086a819f53d4726aab41f3d62652#010423e23c7c086a819f53d4726aab41f3d62652"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8631f8085ec3fa13cff6c0a8abc3c8e5d1c606a9b337fc4faa7c0431004b072"
 dependencies = [
  "proc-macro2",
  "quote",
