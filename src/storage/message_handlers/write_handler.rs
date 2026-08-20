@@ -121,7 +121,7 @@ pub fn commit_write(
         | Request::GetXattr { .. }
         | Request::LatestCommit { .. }
         | Request::RaftGroupLeader { .. }
-        | Request::RaftMessage { .. } => {
+        | Request::ConsensusMessage { .. } => {
             unreachable!()
         }
     }

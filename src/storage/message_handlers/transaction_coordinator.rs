@@ -185,8 +185,7 @@ async fn getattrs(
 ) -> Result<FileOrDirAttrs, ErrorCode> {
     if raft.inode_stored_locally(inode) {
         let rgroup = raft.lookup_by_inode(inode);
-        let latest_commit = rgroup.get_latest_commit_from_leader().await?;
-        rgroup.sync(latest_commit).await?;
+        rgroup.read_barrier().await?;
 
         let response = raft.lookup_by_inode(inode).file_storage().getattr(inode)?;
         match response {
@@ -218,8 +217,7 @@ async fn lookup(
 ) -> Result<u64, ErrorCode> {
     if raft.inode_stored_locally(parent) {
         let rgroup = raft.lookup_by_inode(parent);
-        let latest_commit = rgroup.get_latest_commit_from_leader().await?;
-        rgroup.sync(latest_commit).await?;
+        rgroup.read_barrier().await?;
 
         let inode_response = raft
             .lookup_by_inode(parent)

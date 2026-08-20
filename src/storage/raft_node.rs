@@ -1,8 +1,4 @@
 use log::{error, info, warn};
-use raft::eraftpb::Message;
-use raft::prelude::{ConfChange, ConfChangeType, EntryType};
-use raft::storage::MemStorage;
-use raft::{Config, Error, ProgressTracker, RawNode, StateRole, StorageError};
 use std::sync::Mutex;
 
 use crate::base::LocalContext;
@@ -15,62 +11,48 @@ use crate::storage::message_handlers::commit_write;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::channel::oneshot::Sender;
-use futures::future::{Either, ready};
+use futures::future::{Either, Ready, ready};
 use futures::{Future, TryFutureExt};
-use raft::storage::Storage;
 use rand::Rng;
-use slog::{Drain, o};
-use std::cmp::max;
+use raxos::{Action, CommandId, Config, Replica, ReplicaId, Slot};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::base::{ErrorCode, Request, Response, decode_request, encode_request};
-use protobuf::Message as ProtobufMessage;
 
-// Compact storage when it reaches 10MB
-const COMPACTION_THRESHOLD: u64 = 10 * 1024 * 1024;
-
-// Sync to ensure replicas serve latest data
-pub async fn sync_with_leader(raft: &RaftNode) -> Result<(), ErrorCode> {
-    let latest_commit = raft.get_latest_commit_from_leader().await?;
-    raft.sync(latest_commit).await
-}
+// Warn when a group retains this much consensus history for a lagging
+// replica (the raft integration warned at 2x its 10MB compaction threshold).
+const RETAINED_WARN_BYTES: usize = 32 * 1024 * 1024;
 
 type PendingResponse = Sender<Result<Response, ErrorCode>>;
 
-fn latest_applied_on_all_followers(node_id: u64, progress: &ProgressTracker) -> u64 {
-    progress
-        .iter()
-        .filter(|(id, _)| **id != node_id)
-        .map(|(_, progress)| progress.matched)
-        .min()
-        .unwrap()
-}
-
-pub struct RaftNode {
-    raft_node: Mutex<RawNode<MemStorage>>,
-    pending_responses: Mutex<HashMap<u128, PendingResponse>>,
+// A member of one replication group, wrapping the raxos consensus replica
+// and applying its decided commands to the local FileStorage.
+pub struct ConsensusNode {
+    replica: Mutex<Replica>,
+    pending_responses: Mutex<HashMap<CommandId, PendingResponse>>,
     sync_requests: Mutex<Vec<(u64, Sender<()>)>>,
-    leader_requests: Mutex<Vec<Sender<u64>>>,
     applied_index: AtomicU64,
-    // TODO: this should be part of MemStorage, once we implement our own raft log storage
-    storage_size: AtomicU64,
     peers: HashMap<u64, TcpPeerClient>,
     raft_group_id: u16,
-    node_id: u64,
     file_storage: FileStorage,
     lock_table: Mutex<LockTable>,
+    // Origin of the monotonic clock fed to raxos.
+    start: Instant,
+    // Rate limiter for the retained-history warning (nanos of last warn).
+    last_retained_warn: AtomicU64,
 }
 
-impl RaftNode {
-    pub fn new(context: LocalContext, raft_group_id: u16, num_raft_groups: u16) -> RaftNode {
+impl ConsensusNode {
+    pub fn new(context: LocalContext, raft_group_id: u16, num_raft_groups: u16) -> ConsensusNode {
         // TODO: currently all rgroups reuse the same set of node_ids. Debugging would be easier,
         // if they had unique ids
         let node_id = context.node_id;
-        let mut peer_ids: Vec<u64> = context
+        let mut member_ids: Vec<u64> = context
             .peers_with_node_indices()
             .iter()
             .map(|(peer, peer_index)| (node_id_from_address(peer), *peer_index))
@@ -90,40 +72,21 @@ impl RaftNode {
             raft_group_id,
             context.replicas_per_raft_group,
         ));
-        peer_ids.push(node_id);
+        member_ids.push(node_id);
 
-        let raft_config = Config {
-            id: node_id,
-            // TODO: this is set much longer than the recommended 10x heartbeat,
-            // because we don't handle leader transitions well (likely will crash)
-            election_tick: 100 * 3,
-            heartbeat_tick: 3,
-            // TODO: need to restore this from storage
-            applied: 0,
-            max_size_per_msg: 1024 * 1024 * 1024,
-            max_inflight_msgs: 256,
-            ..Default::default()
-        };
-        raft_config.validate().unwrap();
-        let raft_storage = MemStorage::new();
-        // Bridge the messages to the log backend since we use env_logger
-        let slogger = slog::Logger::root(
-            slog_stdlog::StdLog.fuse(),
-            o!("tag" => format!("peer_{node_id}")),
-        );
-        let mut raft_node = RawNode::new(&raft_config, raft_storage, &slogger).unwrap();
-        // Add the peers
-        // TODO: we should dynamically discover these later and process ConfChange messages in the
-        // message handling loop
-        for &peer in peer_ids.iter() {
-            let mut conf_change = ConfChange {
-                node_id: peer,
-                ..Default::default()
-            };
-            conf_change.set_change_type(ConfChangeType::AddNode);
-            let new_state = raft_node.apply_conf_change(&conf_change).unwrap();
-            raft_node.mut_store().wl().set_conf_state(new_state);
-        }
+        let replicas: Vec<ReplicaId> = member_ids.iter().map(|&id| ReplicaId(id)).collect();
+        // The seed randomizes proposal priorities and marks this process
+        // start for command deduplication, so it must be fresh entropy.
+        //
+        // Retention is unbounded: decided values are kept until every member
+        // acknowledges them, so a partitioned replica can always catch up
+        // once it reconnects (FleetFS has no snapshot/state-transfer path).
+        // A replica that is down forever pins memory on the others, as the
+        // raft log did before; background_tick warns when that grows.
+        let config = Config::new(replicas, ReplicaId(node_id), rand::rng().random())
+            .expect("static group membership is valid")
+            .max_retained_bytes(usize::MAX);
+        let replica = Replica::new(config);
 
         let path = Path::new(&context.data_dir).join(format!("rgroup_{raft_group_id}"));
         #[allow(clippy::expect_fun_call)]
@@ -132,22 +95,19 @@ impl RaftNode {
         let peer_addresses: Vec<SocketAddr> = context
             .peers
             .iter()
-            .filter(|peer| peer_ids.contains(&node_id_from_address(peer)))
+            .filter(|peer| member_ids.contains(&node_id_from_address(peer)))
             .cloned()
             .collect();
 
-        RaftNode {
-            raft_node: Mutex::new(raft_node),
+        ConsensusNode {
+            replica: Mutex::new(replica),
             pending_responses: Mutex::new(HashMap::new()),
-            leader_requests: Mutex::new(vec![]),
             sync_requests: Mutex::new(vec![]),
             applied_index: AtomicU64::new(0),
-            storage_size: AtomicU64::new(0),
             peers: peer_addresses
                 .iter()
                 .map(|peer| (node_id_from_address(peer), TcpPeerClient::new(*peer)))
                 .collect(),
-            node_id,
             raft_group_id,
             file_storage: FileStorage::new(
                 node_id,
@@ -157,6 +117,8 @@ impl RaftNode {
                 &peer_addresses,
             ),
             lock_table: Mutex::new(LockTable::new()),
+            start: Instant::now(),
+            last_retained_warn: AtomicU64::new(0),
         }
     }
 
@@ -173,78 +135,74 @@ impl RaftNode {
         &self.file_storage
     }
 
-    pub fn apply_messages(&self, messages: &[Message]) -> raft::Result<()> {
-        {
-            let mut raft_node = self.raft_node.lock().unwrap();
-
-            for message in messages {
-                assert_eq!(message.to, self.node_id);
-                raft_node.step(message.clone())?;
-            }
-        }
-
-        {
-            self.process_raft_queue();
-        }
-
-        Ok(())
+    fn now(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
     }
 
-    fn send_outgoing_raft_messages(&self, messages: Vec<Message>) {
-        for message in messages {
-            let peer = &self.peers[&message.to];
+    // Runs an input against the consensus replica and carries out the
+    // effects it emits. Decided commands are applied while the replica lock
+    // is held, which keeps deliveries strictly ordered across concurrently
+    // draining tasks (and makes sync()'s applied_index check race-free);
+    // outbound messages are sent after releasing it.
+    fn drive(&self, input: impl FnOnce(&mut Replica, u64)) {
+        let mut sends = vec![];
+        {
+            let mut replica = self.replica.lock().unwrap();
+            input(&mut replica, self.now());
+            while let Some(action) = replica.poll_action() {
+                match action {
+                    Action::Send { to, message } => sends.push((to.0, message.encode())),
+                    Action::Deliver { slot, commands } => self.apply_delivery(slot, commands),
+                }
+            }
+        }
+        for (to, data) in sends {
+            let peer = &self.peers[&to];
             // TODO: errors
-            tokio::spawn(peer.send_raft_message(self.raft_group_id, message));
+            tokio::spawn(peer.send_consensus_message(self.raft_group_id, data));
+        }
+    }
+
+    // Feeds a consensus message received from a peer into the replica.
+    pub fn apply_message(&self, data: &[u8]) {
+        match raxos::Message::decode(data) {
+            Ok(message) => self.drive(|replica, now| replica.receive(now, message)),
+            Err(_) => warn!(
+                "Dropping undecodable consensus message ({} bytes)",
+                data.len()
+            ),
         }
     }
 
     pub fn get_latest_local_commit(&self) -> u64 {
-        let raft_node = self.raft_node.lock().unwrap();
-
-        if raft_node.raft.leader_id == self.node_id {
-            return self.applied_index.load(Ordering::SeqCst);
-        }
-
-        unreachable!();
+        self.applied_index.load(Ordering::SeqCst)
     }
 
-    // TODO: we need to also get the term from the leader. The index alone isn't meaningful
-    pub fn get_latest_commit_from_leader(
-        &self,
-    ) -> impl Future<Output = Result<u64, ErrorCode>> + use<> {
-        let raft_node = self.raft_node.lock().unwrap();
-
-        if raft_node.raft.leader_id == self.node_id {
-            Either::Left(ready(Ok(self.applied_index.load(Ordering::SeqCst))))
-        } else if raft_node.raft.leader_id == 0 {
-            // TODO: wait for a leader
-            Either::Left(ready(Ok(0)))
-        } else {
-            let leader = &self.peers[&raft_node.raft.leader_id];
-            Either::Right(
-                leader
-                    .get_latest_commit(self.raft_group_id)
-                    .map_err(|_| ErrorCode::Uncategorized),
-            )
-        }
+    // A linearizable read barrier: commits an empty command through the log
+    // and resolves once it has been applied locally. FleetFS acknowledges a
+    // write only once the write's slot is applied, and applies slots
+    // contiguously; a slot decided before the barrier was submitted can never
+    // contain the barrier, so the barrier lands in a strictly later slot, and
+    // its local application implies every write acknowledged (anywhere)
+    // before this call is applied locally too. Completing a barrier requires
+    // a full consensus round, so it doubles as the group readiness check.
+    // Concurrent barriers and writes batch into shared slots inside raxos.
+    pub fn read_barrier(&self) -> impl Future<Output = Result<(), ErrorCode>> + use<> {
+        self.propose_raw(Vec::new()).map_ok(|_| ())
     }
 
-    pub fn get_leader(&self) -> impl Future<Output = Result<u64, ErrorCode>> + use<> {
-        let raft_node = self.raft_node.lock().unwrap();
-
-        if raft_node.raft.leader_id > 0 {
-            Either::Left(ready(Ok(raft_node.raft.leader_id)))
-        } else {
-            let (sender, receiver) = oneshot::channel();
-            self.leader_requests.lock().unwrap().push(sender);
-            Either::Right(receiver.map(|x| x.map_err(|_| ErrorCode::Uncategorized)))
-        }
+    // The leader is always defined in raxos (first replica of the hedging
+    // schedule), so unlike raft there is no waiting for an election.
+    pub fn get_leader(&self) -> Ready<Result<u64, ErrorCode>> {
+        let leader = self.replica.lock().unwrap().leader().0;
+        ready(Ok(leader))
     }
 
     // Wait until the given index has been committed
     pub fn sync(&self, index: u64) -> impl Future<Output = Result<(), ErrorCode>> + use<> {
-        // Make sure we have the lock on all data structures
-        let _raft_node_locked = self.raft_node.lock().unwrap();
+        // The replica lock makes the applied_index check atomic with respect
+        // to the apply path in drive().
+        let _replica_locked = self.replica.lock().unwrap();
 
         if self.applied_index.load(Ordering::SeqCst) >= index {
             Either::Left(ready(Ok(())))
@@ -257,26 +215,27 @@ impl RaftNode {
 
     // Should be called once every 100ms to handle background tasks
     pub fn background_tick(&self) {
-        {
-            let mut raft_node = self.raft_node.lock().unwrap();
-            raft_node.tick();
+        self.drive(|replica, now| replica.tick(now));
 
-            let leader_id = raft_node.raft.leader_id;
-            if leader_id > 0 {
-                self.leader_requests
-                    .lock()
-                    .unwrap()
-                    .drain(..)
-                    .for_each(|sender| sender.send(leader_id).unwrap());
+        // Retention is unbounded so lagging replicas always remain
+        // recoverable (see new()); surface sustained growth, which means
+        // some replica has been unreachable for a long time.
+        let retained = self.replica.lock().unwrap().retained_bytes();
+        if retained > RETAINED_WARN_BYTES {
+            let now = self.now();
+            let last = self.last_retained_warn.load(Ordering::Relaxed);
+            if now.saturating_sub(last) > 60_000_000_000
+                && self
+                    .last_retained_warn
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                warn!(
+                    "rgroup {}: retaining {} bytes of consensus history for a lagging replica",
+                    self.raft_group_id, retained
+                );
             }
         }
-        // TODO: should be able to only do this on ready, I think
-        self.process_raft_queue();
-    }
-
-    fn process_raft_queue(&self) {
-        let messages = self._process_raft_queue().unwrap();
-        self.send_outgoing_raft_messages(messages);
     }
 
     fn _process_lock_table(
@@ -333,29 +292,20 @@ impl RaftNode {
         to_process
     }
 
-    fn _process_commited_entries(
-        &self,
-        entries: &[raft::prelude::Entry],
-        raft_node: &RawNode<MemStorage>,
-    ) {
-        let mut applied_index = self.applied_index.load(Ordering::SeqCst);
-        for entry in entries {
-            // TODO: probably need to save the term too
-            applied_index = max(applied_index, entry.index);
-
-            if entry.data.is_empty() {
-                // New leaders send empty entries
+    // Applies one decided slot to the local state machine, resolving the
+    // pending client response if this node was the submitter. Runs while the
+    // replica lock is held; must not re-enter self.replica.
+    fn apply_delivery(&self, slot: Slot, commands: Vec<(CommandId, Vec<u8>)>) {
+        for (command_id, data) in commands {
+            let pending_response = self.pending_responses.lock().unwrap().remove(&command_id);
+            if data.is_empty() {
+                // A read barrier: nothing to apply, committing it was the point.
+                if let Some(sender) = pending_response {
+                    sender.send(Ok(Response::Empty)).ok();
+                }
                 continue;
             }
-
-            assert_eq!(entry.entry_type, EntryType::EntryNormal);
-
-            let mut pending_responses = self.pending_responses.lock().unwrap();
-
-            let mut uuid = [0; 16];
-            uuid.copy_from_slice(&entry.context[0..16]);
-            let pending_response = pending_responses.remove(&u128::from_le_bytes(uuid));
-            let to_process = self._process_lock_table(entry.data.to_vec(), pending_response);
+            let to_process = self._process_lock_table(data, pending_response);
 
             for (data, pending_response) in to_process {
                 let request = decode_request(&data).unwrap();
@@ -408,166 +358,53 @@ impl RaftNode {
                     }
                 }
 
-                info!(
-                    "Committed write index {} (leader={}): {:?}",
-                    entry.index, raft_node.raft.leader_id, request
-                );
+                info!("Committed write slot {}: {:?}", slot.0, request);
             }
         }
 
-        self.applied_index.store(applied_index, Ordering::SeqCst);
-    }
-
-    // Returns the last applied index
-    fn _process_raft_queue(&self) -> raft::Result<Vec<Message>> {
-        let mut raft_node = self.raft_node.lock().unwrap();
-
-        if !raft_node.has_ready() {
-            return Ok(vec![]);
-        }
-
-        let mut ready = raft_node.ready();
-
-        if !ready.snapshot().is_empty() {
-            raft_node
-                .mut_store()
-                .wl()
-                .apply_snapshot(ready.snapshot().clone())?;
-        }
-
-        let mut entries_size = 0u64;
-        if !ready.entries().is_empty() {
-            for entry in ready.entries().iter() {
-                entries_size += entry.compute_size() as u64;
-            }
-            raft_node.mut_store().wl().append(ready.entries())?;
-        }
-        self.storage_size.fetch_add(entries_size, Ordering::SeqCst);
-
-        if let Some(hard_state) = ready.hs() {
-            raft_node.mut_store().wl().set_hardstate(hard_state.clone());
-        }
-
-        self._process_commited_entries(&ready.take_committed_entries(), &raft_node);
-
-        // TODO: should be checkpointing to disk
-        // Attempt to compact the log once it reaches the compaction threshold
-        // TODO: if the log becomes too full we might OOM. Change this to write to disk
-        let applied_index = self.applied_index.load(Ordering::SeqCst);
-        let storage_size = self.storage_size.load(Ordering::SeqCst);
-        if storage_size > COMPACTION_THRESHOLD {
-            if storage_size > 2 * COMPACTION_THRESHOLD {
-                warn!(
-                    "Raft log storage has exceeded memory limit. Current size: {} bytes",
-                    storage_size
-                );
-            }
-            // TODO: Snapshots aren't implemented, so ensure that we keep any entries
-            // that still need to be replicated to a follower(s)
-            let mut compact_to = match raft_node.raft.state {
-                StateRole::Leader => {
-                    latest_applied_on_all_followers(self.node_id, raft_node.raft.prs())
-                }
-                StateRole::Follower => applied_index,
-                StateRole::Candidate | StateRole::PreCandidate => applied_index,
-            };
-            compact_to = compact_to.saturating_sub(1);
-            if let Err(error) = raft_node.mut_store().wl().compact(compact_to) {
-                match error {
-                    Error::Store(store_error) => match store_error {
-                        StorageError::Compacted => {} // no-op
-                        e => {
-                            panic!("Error during compaction: {e}");
-                        }
-                    },
-                    e => {
-                        panic!("Error during compaction: {e}");
-                    }
-                }
-            }
-            let last = raft_node.store().last_index().unwrap();
-            let first = raft_node.store().first_index().unwrap();
-            let mut new_size = 0u64;
-            let entries = raft_node.store().entries(first, last, 999_999_999).unwrap();
-            for entry in entries {
-                new_size += entry.compute_size() as u64;
-            }
-            self.storage_size.store(new_size, Ordering::SeqCst);
-        }
+        self.applied_index.store(slot.0, Ordering::SeqCst);
 
         // TODO: once drain_filter is stable, it could be used to make this a lot nicer
         let mut sync_requests = self.sync_requests.lock().unwrap();
         while !sync_requests.is_empty() {
-            if applied_index >= sync_requests[0].0 {
+            if slot.0 >= sync_requests[0].0 {
                 let (_, sender) = sync_requests.remove(0);
                 sender.send(()).unwrap();
             } else {
                 break;
             }
         }
-
-        if let Err(e) = raft_node.mut_store().wl().append(ready.entries()) {
-            panic!("persist raft log fail: {e:?}, need to retry or panic");
-        }
-
-        let mut messages = ready.take_messages();
-        messages.extend(ready.take_persisted_messages());
-        let mut light_ready = raft_node.advance(ready);
-
-        if let Some(commit) = light_ready.commit_index() {
-            raft_node
-                .mut_store()
-                .wl()
-                .mut_hard_state()
-                .set_commit(commit);
-        }
-        // Send these messages as well
-        messages.extend(light_ready.take_messages());
-        self._process_commited_entries(&light_ready.take_committed_entries(), &raft_node);
-        raft_node.advance_apply();
-
-        Ok(messages)
-    }
-
-    fn _propose(&self, uuid: u128, data: Vec<u8>) {
-        let mut raft_node = self.raft_node.lock().unwrap();
-        raft_node
-            .propose(uuid.to_le_bytes().to_vec(), data)
-            .unwrap();
     }
 
     pub fn propose(
         &self,
         request: &Request<'_>,
     ) -> impl Future<Output = Result<Response, ErrorCode>> + use<> {
-        let uuid: u128 = rand::rng().random();
-
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending_responses = self.pending_responses.lock().unwrap();
-            pending_responses.insert(uuid, sender);
-        }
-        self._propose(uuid, encode_request(request));
-
-        self.process_raft_queue();
-
-        receiver.map(|x| x.unwrap_or(Err(ErrorCode::Uncategorized)))
+        self.propose_raw(encode_request(request))
     }
 
     pub fn propose_raw(
         &self,
         request: Vec<u8>,
     ) -> impl Future<Output = Result<Response, ErrorCode>> + use<> {
-        let uuid: u128 = rand::rng().random();
-
         let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending_responses = self.pending_responses.lock().unwrap();
-            pending_responses.insert(uuid, sender);
-        }
-        self._propose(uuid, request);
-
-        self.process_raft_queue();
+        let mut sender = Some(sender);
+        self.drive(|replica, now| match replica.submit(now, &request) {
+            Ok(command_id) => {
+                self.pending_responses
+                    .lock()
+                    .unwrap()
+                    .insert(command_id, sender.take().unwrap());
+            }
+            Err(error) => {
+                warn!("Rejecting proposal: {error}");
+                sender
+                    .take()
+                    .unwrap()
+                    .send(Err(ErrorCode::Uncategorized))
+                    .ok();
+            }
+        });
 
         receiver.map(|x| x.unwrap_or(Err(ErrorCode::Uncategorized)))
     }

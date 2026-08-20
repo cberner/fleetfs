@@ -2,7 +2,6 @@ use crate::base::LocalContext;
 use crate::base::{ErrorCode, Response};
 use crate::client::{PeerClient, TcpPeerClient};
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
-use crate::storage::raft_node::sync_with_leader;
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +12,7 @@ pub async fn fsck(
 ) -> Result<Response, ErrorCode> {
     let mut local_checksums = HashMap::new();
     for rgroup in raft.all_groups() {
-        sync_with_leader(rgroup).await?;
+        rgroup.read_barrier().await?;
         let checksum = rgroup.local_data_checksum()?;
         local_checksums.insert(rgroup.get_raft_group_id(), checksum);
     }
@@ -47,7 +46,7 @@ pub async fn fsck(
 pub async fn checksum_request(raft: Arc<LocalRaftGroupManager>) -> Result<Response, ErrorCode> {
     let mut checksums = HashMap::new();
     for rgroup in raft.all_groups() {
-        sync_with_leader(rgroup).await?;
+        rgroup.read_barrier().await?;
 
         let checksum = rgroup.local_data_checksum()?;
         checksums.insert(rgroup.get_raft_group_id(), checksum);
