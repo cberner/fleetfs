@@ -5,7 +5,7 @@ use crate::base::{
 use crate::base::{check_access, response_or_error};
 use crate::client::RemoteRaftGroups;
 use crate::storage::raft_group_manager::LocalRaftGroupManager;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
