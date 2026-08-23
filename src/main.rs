@@ -249,7 +249,7 @@ fn main() -> Result<(), ErrorCode> {
         } else {
             SessionACL::Owner
         };
-        fuser::mount2(fs, &mount_point, &config).unwrap();
+        fuser::mount(fs, &mount_point, &config).unwrap();
     }
 
     Ok(())

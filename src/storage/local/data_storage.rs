@@ -93,7 +93,7 @@ impl<T: PeerClient> DataStorage<T> {
                     .unwrap()
                     .trim_start_matches(&self.local_data_dir)
                     .as_bytes();
-                hasher.write_all(path_bytes).unwrap();
+                hasher.update(path_bytes);
             }
             // TODO handle other file types
         }
@@ -308,7 +308,7 @@ mod tests {
     };
     use futures::future::{BoxFuture, ready};
     use futures_util::future::FutureExt;
-    use rand::Rng;
+    use rand::RngExt;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::fs;

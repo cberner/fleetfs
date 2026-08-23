@@ -13,7 +13,7 @@ use futures::channel::oneshot;
 use futures::channel::oneshot::Sender;
 use futures::future::{Either, Ready, ready};
 use futures::{Future, TryFutureExt};
-use rand::Rng;
+use rand::RngExt;
 use raxos::{Action, CommandId, Config, Replica, ReplicaId, Slot};
 use std::collections::HashMap;
 use std::fs;
