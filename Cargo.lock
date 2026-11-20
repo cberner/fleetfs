@@ -705,9 +705,9 @@ dependencies = [
 
 [[package]]
 name = "redb-derive"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37e3e4a65184277f3fbc05f879a1729b2928845ff7b188739e14457b8e50ae89"
+checksum = "d8b542777ce680b69ce80a5ae93ce438e4416e52b7c1471cfdcd92ee28f28ed8"
 dependencies = [
  "proc-macro2",
  "quote",
